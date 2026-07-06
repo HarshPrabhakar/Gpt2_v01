@@ -1,97 +1,120 @@
-import os
-from pathlib import Path
+"""
+=========================================================
+Project : MyGPT2
+File    : dataset_manager.py
+Purpose : Main controller for Dataset Management System
+Author  : Harsh Prabhakar
+=========================================================
+"""
 
-# ----------------------------------------
-# Set Hugging Face Cache BEFORE imports
-# ----------------------------------------
+from scripts.dataset_registry import (
+    get_all_datasets,
+)
 
-os.environ["HF_HOME"] = r"D:\HuggingFaceCache"
+from scripts.download import (
+    download_dataset,
+    download_all,
+)
 
-from datasets import load_dataset
+from scripts.menu import (
+    show_main_menu,
+    show_dataset_status,
+    show_storage_report,
+    wait_for_user,
+)
 
-from config import *
+from scripts.utils import (
+    log,
+)
 
-# ----------------------------------------
-# Dataset Registry
-# ----------------------------------------
-
-DATASETS = [
-
-    {
-        "name": "TinyStories",
-        "hf_id": "roneneldan/TinyStories",
-        "config": None,
-        "split": None,
-        "save_path": TINYSTORIES_PATH
-    },
-
-    {
-        "name": "WikiText103",
-        "hf_id": "Salesforce/wikitext",
-        "config": "wikitext-103-v1",
-        "split": None,
-        "save_path": WIKITEXT_PATH
-    },
-
-    {
-        "name": "OpenWebText",
-        "hf_id": "Skylion007/openwebtext",
-        "config": None,
-        "split": "train[:10%]",
-        "save_path": OPENWEBTEXT_PATH
-    },
-
-    {
-        "name": "FineWeb",
-        "hf_id": "HuggingFaceFW/fineweb",
-        "config": "sample-10BT",
-        "split": "train[:2%]",
-        "save_path": FINEWEB_PATH
-    }
-
-]
-
-# ----------------------------------------
-# Download Function
-# ----------------------------------------
-
-def download_dataset(dataset):
-
-    save_path = Path(dataset["save_path"])
-
-    if save_path.exists():
-
-        print(f"✓ {dataset['name']} already downloaded.")
-
-        return
-
-    print(f"\nDownloading {dataset['name']}...")
-
-    ds = load_dataset(
-
-        dataset["hf_id"],
-
-        name=dataset["config"],
-
-        split=dataset["split"]
-
-    )
-
-    ds.save_to_disk(save_path)
-
-    print(f"Saved to {save_path}")
-
-
-# ----------------------------------------
-# Main
-# ----------------------------------------
+# ==========================================================
+# Main Loop
+# ==========================================================
 
 def main():
 
-    for dataset in DATASETS:
+    datasets = get_all_datasets()
 
-        download_dataset(dataset)
+    while True:
 
+        choice = show_main_menu()
+
+        # ---------------------------------------------
+        # Quit
+        # ---------------------------------------------
+
+        if choice == "Q":
+
+            log("Closing Dataset Manager.")
+
+            print("\nGoodbye!\n")
+
+            break
+
+        # ---------------------------------------------
+        # Download All
+        # ---------------------------------------------
+
+        elif choice == "A":
+
+            download_all(datasets)
+
+            wait_for_user()
+
+        # ---------------------------------------------
+        # Dataset Status
+        # ---------------------------------------------
+
+        elif choice == "S":
+
+            show_dataset_status()
+
+            wait_for_user()
+
+        # ---------------------------------------------
+        # Storage Report
+        # ---------------------------------------------
+
+        elif choice == "R":
+
+            show_storage_report()
+
+            wait_for_user()
+
+        # ---------------------------------------------
+        # Download Individual Dataset
+        # ---------------------------------------------
+
+        elif choice.isdigit():
+
+            index = int(choice) - 1
+
+            if 0 <= index < len(datasets):
+
+                dataset = datasets[index]
+
+                download_dataset(dataset)
+
+            else:
+
+                print("\nInvalid dataset number.\n")
+
+            wait_for_user()
+
+        # ---------------------------------------------
+        # Invalid Input
+        # ---------------------------------------------
+
+        else:
+
+            print("\nInvalid option.\n")
+
+            wait_for_user()
+
+
+# ==========================================================
+# Entry Point
+# ==========================================================
 
 if __name__ == "__main__":
 

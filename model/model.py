@@ -1,46 +1,49 @@
 """
-============================================================
-MyGPTModel
-============================================================
+=============================================================
+MyGPT2 Language Model
+=============================================================
 
-Complete GPT-2 Style Language Model
+This module defines the main GPT architecture.
 
-Architecture:
+Responsibilities
+----------------
+• Build Embedding Layer
+• Build Transformer Stack
+• Final LayerNorm
+• Language Modeling Head
+• Weight Tying
 
-Input Tokens
-      ↓
-Embeddings
-      ↓
-Transformer Blocks (12x)
-      ↓
-Final LayerNorm
-      ↓
-Language Modeling Head
-      ↓
-Vocabulary Logits
+Forward propagation and utility methods are implemented
+inside separate modules.
 
-Author : Harsh Prabhakar
 Project : MyGPT2
-============================================================
+Author  : Harsh Prabhakar
+=============================================================
 """
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from model.config import GPTConfig
 from model.embeddings import GPTEmbeddings
 from model.transformer_block import TransformerBlock
 
+# Helper Modules
+from model.forward import forward
+from model.initialization import initialize_weights
+from model.optimizer import configure_optimizer
+from model.checkpoint import save_checkpoint
+from model.checkpoint import load_checkpoint
+from model.parameter_counter import count_parameters
+
 
 class MyGPTModel(nn.Module):
     """
-    GPT-2 Style Language Model.
+    GPT-2 Style Decoder Only Transformer
     """
 
     def __init__(self, config: GPTConfig):
@@ -49,111 +52,110 @@ class MyGPTModel(nn.Module):
 
         self.config = config
 
-        # ====================================================
+        # -------------------------------------------------
         # Embedding Layer
-        # ====================================================
+        # -------------------------------------------------
 
-        self.embeddings = GPTEmbeddings(
-            config
-        )
+        self.embeddings = GPTEmbeddings(config)
 
-        # ====================================================
-        # Transformer Stack
-        # ====================================================
+        # -------------------------------------------------
+        # Transformer Blocks
+        # -------------------------------------------------
 
         self.blocks = nn.ModuleList(
+
             [
                 TransformerBlock(config)
+
                 for _ in range(config.num_layers)
+
             ]
+
         )
 
-        # ====================================================
+        # -------------------------------------------------
         # Final Layer Normalization
-        # ====================================================
+        # -------------------------------------------------
 
         self.final_layer_norm = nn.LayerNorm(
+
             normalized_shape=config.hidden_size,
-            eps=config.layer_norm_epsilon,
+
+            eps=config.layer_norm_epsilon
+
         )
 
-        # ====================================================
+        # -------------------------------------------------
         # Language Modeling Head
-        # ====================================================
+        # -------------------------------------------------
 
         self.lm_head = nn.Linear(
+
             in_features=config.hidden_size,
+
             out_features=config.vocab_size,
-            bias=False,
+
+            bias=False
+
         )
 
-        # ====================================================
+        # -------------------------------------------------
         # Weight Tying
-        # ====================================================
+        # -------------------------------------------------
 
         self.lm_head.weight = (
+
             self.embeddings.token_embeddings.weight
+
         )
 
-        # ====================================================
-        # Initialize Weights
-        # ====================================================
+        # -------------------------------------------------
+        # Weight Initialization
+        # -------------------------------------------------
 
-        self.apply(
-            self._init_weights
-        )
+        initialize_weights(self)
 
-        # ====================================================
-        # Print Model Information
-        # ====================================================
+        # -------------------------------------------------
+        # Print Summary
+        # -------------------------------------------------
 
-        print("\n" + "=" * 60)
-        print("MyGPTModel Initialized")
+        total = count_parameters(self)
+
+        print()
+
+        print("=" * 60)
+        print("MyGPT2 Successfully Built")
         print("=" * 60)
 
-        print(
-            f"Vocabulary Size : "
-            f"{config.vocab_size:,}"
-        )
-
-        print(
-            f"Hidden Size     : "
-            f"{config.hidden_size}"
-        )
-
-        print(
-            f"Layers          : "
-            f"{config.num_layers}"
-        )
-
-        print(
-            f"Heads           : "
-            f"{config.num_attention_heads}"
-        )
-
-        print(
-            f"Context Length  : "
-            f"{config.max_position_embeddings}"
-        )
-
-        print(
-            f"Device          : "
-            f"{config.device}"
-        )
+        print(f"Vocabulary Size : {config.vocab_size:,}")
+        print(f"Context Length  : {config.max_position_embeddings}")
+        print(f"Hidden Size     : {config.hidden_size}")
+        print(f"Layers          : {config.num_layers}")
+        print(f"Heads           : {config.num_attention_heads}")
+        print(f"Parameters      : {total:,}")
 
         print("=" * 60)
 
-    # ========================================================
-    # Weight Initialization Placeholder
-    # ========================================================
+    # =====================================================
+    # Forward
+    # =====================================================
 
-    def _init_weights(
-        self,
-        module: nn.Module
-    ):
-        """
-        GPT-style initialization.
+    forward = forward
 
-        Full implementation added in Part 2.
-        """
-        pass
+    # =====================================================
+    # Optimizer
+    # =====================================================
+
+    configure_optimizer = configure_optimizer
+
+    # =====================================================
+    # Save
+    # =====================================================
+
+    save = save_checkpoint
+
+    # =====================================================
+    # Load
+    # =====================================================
+
+    load = load_checkpoint

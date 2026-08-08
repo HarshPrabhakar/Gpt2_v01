@@ -5,34 +5,25 @@ MyGPT2 - Optimizer
 
 Purpose
 -------
-Creates and configures the optimizer used to train MyGPT2.
+Creates and validates the optimizer used to train MyGPT2.
 
 Optimizer:
     AdamW
 
-The implementation separates model parameters into two groups:
+The optimizer separates parameters into two groups:
 
     1. Parameters WITH weight decay
     2. Parameters WITHOUT weight decay
 
-Weight decay is applied to normal weight matrices, while
-biases and normalization parameters are excluded.
-
-This is the standard approach for GPT-style models.
+Biases and LayerNorm parameters do not receive weight decay.
 
 ============================================================
 """
 
 from __future__ import annotations
 
-
-# ============================================================
-# Standard Library
-# ============================================================
-
 import sys
 from pathlib import Path
-from typing import Iterable
 
 
 # ============================================================
@@ -46,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ============================================================
-# Third-Party
+# PyTorch
 # ============================================================
 
 import torch
@@ -55,12 +46,11 @@ from torch.optim import AdamW
 
 
 # ============================================================
-# Default Configuration
+# Default Optimizer Configuration
 # ============================================================
 
 DEFAULT_LEARNING_RATE = 3e-4
-
-DEFAULT_WEIGHT_DECAY = 0.1
+DEFAULT_WEIGHT_DECAY = 0.01
 
 DEFAULT_BETAS = (
     0.9,
@@ -76,61 +66,38 @@ DEFAULT_EPS = 1e-8
 
 def classify_parameters(
     model: nn.Module,
-) -> tuple[
-    list[tuple[str, nn.Parameter]],
-    list[tuple[str, nn.Parameter]],
-]:
+):
     """
-    Separate model parameters into:
+    Separate trainable parameters into decay and no-decay
+    groups.
 
-        decay_parameters
-        no_decay_parameters
+    Weight decay:
+        Normal weight parameters.
 
-    Weight decay is applied to normal weight matrices.
-
-    Biases and normalization parameters are excluded from
-    weight decay.
-
-    Returns
-    -------
-    decay_parameters:
-        Parameters receiving weight decay.
-
-    no_decay_parameters:
-        Parameters receiving zero weight decay.
+    No weight decay:
+        Biases.
+        LayerNorm parameters.
+        Other normalization parameters.
     """
 
     decay_parameters = []
-
     no_decay_parameters = []
-
-    # --------------------------------------------------------
-    # Iterate through model parameters
-    # --------------------------------------------------------
 
     for name, parameter in model.named_parameters():
 
-        # ----------------------------------------------------
-        # Ignore frozen parameters
-        # ----------------------------------------------------
-
         if not parameter.requires_grad:
-
             continue
+
+        name_lower = name.lower()
 
         # ----------------------------------------------------
         # Bias
         # ----------------------------------------------------
 
-        if name.endswith(
-            ".bias"
-        ):
+        if name.endswith(".bias"):
 
             no_decay_parameters.append(
-                (
-                    name,
-                    parameter,
-                )
+                (name, parameter)
             )
 
             continue
@@ -139,8 +106,6 @@ def classify_parameters(
         # Normalization parameters
         # ----------------------------------------------------
 
-        name_lower = name.lower()
-
         if (
             "norm" in name_lower
             or "layernorm" in name_lower
@@ -148,10 +113,7 @@ def classify_parameters(
         ):
 
             no_decay_parameters.append(
-                (
-                    name,
-                    parameter,
-                )
+                (name, parameter)
             )
 
             continue
@@ -161,10 +123,7 @@ def classify_parameters(
         # ----------------------------------------------------
 
         decay_parameters.append(
-            (
-                name,
-                parameter,
-            )
+            (name, parameter)
         )
 
     return (
@@ -185,65 +144,41 @@ def create_optimizer(
     eps: float = DEFAULT_EPS,
 ) -> AdamW:
     """
-    Create AdamW optimizer for MyGPT2.
-
-    Parameters
-    ----------
-    model:
-        MyGPT2 model.
-
-    learning_rate:
-        Initial learning rate.
-
-    weight_decay:
-        Weight decay applied to eligible parameters.
-
-    betas:
-        AdamW beta values.
-
-    eps:
-        Numerical stability value.
-
-    Returns
-    -------
-    torch.optim.AdamW
+    Create an AdamW optimizer for MyGPT2.
     """
 
     # --------------------------------------------------------
-    # Validate
+    # Validation
     # --------------------------------------------------------
 
     if learning_rate <= 0:
-
         raise ValueError(
             "learning_rate must be greater than zero."
         )
 
     if weight_decay < 0:
-
         raise ValueError(
             "weight_decay cannot be negative."
         )
 
     if len(betas) != 2:
-
         raise ValueError(
             "betas must contain exactly two values."
         )
 
     beta1, beta2 = betas
 
-    if not (
-        0 <= beta1 < 1
-        and 0 <= beta2 < 1
-    ):
-
+    if not (0 <= beta1 < 1):
         raise ValueError(
-            "AdamW beta values must be in [0, 1)."
+            "beta1 must be in [0, 1)."
+        )
+
+    if not (0 <= beta2 < 1):
+        raise ValueError(
+            "beta2 must be in [0, 1)."
         )
 
     if eps <= 0:
-
         raise ValueError(
             "eps must be greater than zero."
         )
@@ -256,25 +191,24 @@ def create_optimizer(
         classify_parameters(model)
     )
 
-    if len(decay_parameters) == 0:
-
+    if not decay_parameters:
         raise RuntimeError(
             "No parameters were assigned to "
             "the weight-decay group."
         )
 
-    if len(no_decay_parameters) == 0:
-
+    if not no_decay_parameters:
         raise RuntimeError(
             "No parameters were assigned to "
             "the no-weight-decay group."
         )
 
     # --------------------------------------------------------
-    # Parameter groups
+    # Create parameter groups
     # --------------------------------------------------------
 
     parameter_groups = [
+
         {
             "params": [
                 parameter
@@ -283,6 +217,7 @@ def create_optimizer(
             ],
             "weight_decay": weight_decay,
         },
+
         {
             "params": [
                 parameter
@@ -291,10 +226,11 @@ def create_optimizer(
             ],
             "weight_decay": 0.0,
         },
+
     ]
 
     # --------------------------------------------------------
-    # Create AdamW
+    # AdamW
     # --------------------------------------------------------
 
     optimizer = AdamW(
@@ -316,7 +252,7 @@ def get_optimizer_statistics(
     optimizer: torch.optim.Optimizer,
 ) -> dict:
     """
-    Return useful optimizer statistics.
+    Return optimizer statistics.
     """
 
     decay_parameters, no_decay_parameters = (
@@ -341,28 +277,36 @@ def get_optimizer_statistics(
     )
 
     return {
-        "total_parameters": total_parameters,
-        "decay_parameters": decay_count,
-        "no_decay_parameters": no_decay_count,
-        "parameter_groups": len(
-            optimizer.param_groups
-        ),
-        "learning_rate": optimizer.param_groups[0]["lr"],
-        "weight_decay": optimizer.param_groups[0]["weight_decay"],
+
+        "total_parameters":
+            total_parameters,
+
+        "decay_parameters":
+            decay_count,
+
+        "no_decay_parameters":
+            no_decay_count,
+
+        "parameter_groups":
+            len(optimizer.param_groups),
+
+        "learning_rate":
+            optimizer.param_groups[0]["lr"],
+
+        "weight_decay":
+            optimizer.param_groups[0]["weight_decay"],
+
     }
 
 
 # ============================================================
-# Print Optimizer Summary
+# Print Summary
 # ============================================================
 
 def print_optimizer_summary(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> None:
-    """
-    Print optimizer configuration and parameter statistics.
-    """
 
     stats = get_optimizer_statistics(
         model,
@@ -416,27 +360,23 @@ def print_optimizer_summary(
     )
 
     print(
-        f"No Decay Params     : "
+        f"No Decay Params      : "
         f"{stats['no_decay_parameters']:,}"
     )
 
     print()
 
     print(
-        "AdamW Betas          : "
+        f"AdamW Betas          : "
         f"{optimizer.defaults['betas']}"
     )
 
     print(
-        "AdamW Epsilon        : "
+        f"AdamW Epsilon        : "
         f"{optimizer.defaults['eps']}"
     )
 
     print()
-
-    print(
-        "=" * 70
-    )
 
 
 # ============================================================
@@ -447,26 +387,19 @@ def verify_optimizer(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> None:
-    """
-    Perform consistency checks on the optimizer.
-
-    Raises an error if a trainable parameter is missing
-    from the optimizer.
-    """
 
     # --------------------------------------------------------
-    # Collect model parameters
+    # Model parameters
     # --------------------------------------------------------
 
     model_parameters = {
         id(parameter): parameter
-        for parameter
-        in model.parameters()
+        for parameter in model.parameters()
         if parameter.requires_grad
     }
 
     # --------------------------------------------------------
-    # Collect optimizer parameters
+    # Optimizer parameters
     # --------------------------------------------------------
 
     optimizer_parameters = {}
@@ -480,7 +413,7 @@ def verify_optimizer(
             ] = parameter
 
     # --------------------------------------------------------
-    # Check missing parameters
+    # Missing parameters
     # --------------------------------------------------------
 
     missing_parameters = (
@@ -496,7 +429,7 @@ def verify_optimizer(
         )
 
     # --------------------------------------------------------
-    # Check duplicates
+    # Duplicate parameters
     # --------------------------------------------------------
 
     parameter_ids = []
@@ -520,7 +453,7 @@ def verify_optimizer(
 
 
 # ============================================================
-# Test
+# Main Test
 # ============================================================
 
 if __name__ == "__main__":
@@ -540,6 +473,12 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
+    # Import configuration
+    # --------------------------------------------------------
+
+    from model.config import GPTConfig
+
+    # --------------------------------------------------------
     # Import model
     # --------------------------------------------------------
 
@@ -551,32 +490,6 @@ if __name__ == "__main__":
 
         print(
             "Could not import MyGPTModel."
-        )
-
-        print(
-            f"Error: {exc}"
-        )
-
-        print()
-
-        print(
-            "Make sure your model package is available."
-        )
-
-        raise
-
-    # --------------------------------------------------------
-    # Import configuration
-    # --------------------------------------------------------
-
-    try:
-
-        from model.config import GPTConfig
-
-    except ImportError as exc:
-
-        print(
-            "Could not import GPTConfig."
         )
 
         print(
@@ -627,23 +540,33 @@ if __name__ == "__main__":
     config = GPTConfig()
 
     print(
-        f"Vocabulary Size : "
+        f"Vocabulary Size      : "
         f"{config.vocab_size:,}"
     )
 
     print(
-        f"Hidden Size     : "
+        f"Context Length       : "
+        f"{config.max_position_embeddings}"
+    )
+
+    print(
+        f"Hidden Size          : "
         f"{config.hidden_size}"
     )
 
     print(
-        f"Layers          : "
+        f"Transformer Layers   : "
         f"{config.num_layers}"
     )
 
     print(
-        f"Attention Heads : "
-        f"{config.num_heads}"
+        f"Attention Heads      : "
+        f"{config.num_attention_heads}"
+    )
+
+    print(
+        f"Intermediate Size    : "
+        f"{config.intermediate_size}"
     )
 
     print()
@@ -676,14 +599,26 @@ if __name__ == "__main__":
         in model.parameters()
     )
 
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter
+        in model.parameters()
+        if parameter.requires_grad
+    )
+
     print(
-        f"Model Parameters : "
+        f"Total Parameters     : "
         f"{total_parameters:,}"
     )
 
     print(
-        f"Model Parameters : "
+        f"Total Parameters     : "
         f"{total_parameters / 1e6:.2f}M"
+    )
+
+    print(
+        f"Trainable Parameters  : "
+        f"{trainable_parameters:,}"
     )
 
     print()
@@ -698,9 +633,13 @@ if __name__ == "__main__":
 
     optimizer = create_optimizer(
         model=model,
-        learning_rate=DEFAULT_LEARNING_RATE,
-        weight_decay=DEFAULT_WEIGHT_DECAY,
+
+        learning_rate=config.learning_rate,
+
+        weight_decay=config.weight_decay,
+
         betas=DEFAULT_BETAS,
+
         eps=DEFAULT_EPS,
     )
 
@@ -735,24 +674,24 @@ if __name__ == "__main__":
     )
 
     # --------------------------------------------------------
-    # Test optimizer step
+    # Test forward/backward
     # --------------------------------------------------------
 
     print(
-        "Testing optimizer step..."
+        "Testing optimizer update..."
     )
 
     optimizer.zero_grad(
         set_to_none=True
     )
 
-    # --------------------------------------------------------
-    # Create tiny test batch
-    # --------------------------------------------------------
-
     batch_size = 2
 
     sequence_length = 32
+
+    # --------------------------------------------------------
+    # Random input
+    # --------------------------------------------------------
 
     input_ids = torch.randint(
         low=0,
@@ -805,10 +744,17 @@ if __name__ == "__main__":
 
         loss = output.loss
 
+    elif isinstance(
+        output,
+        tuple,
+    ):
+
+        loss = output[1]
+
     else:
 
         raise RuntimeError(
-            "Model output does not contain a loss."
+            "Unable to find loss in model output."
         )
 
     if loss is None:
@@ -818,7 +764,7 @@ if __name__ == "__main__":
         )
 
     print(
-        f"Test Loss : "
+        f"Test Loss             : "
         f"{loss.item():.6f}"
     )
 
@@ -827,6 +773,10 @@ if __name__ == "__main__":
     # --------------------------------------------------------
 
     loss.backward()
+
+    print(
+        "Backward pass         : ✅ PASSED"
+    )
 
     # --------------------------------------------------------
     # Gradient verification
@@ -838,23 +788,25 @@ if __name__ == "__main__":
 
     for parameter in model.parameters():
 
-        if parameter.grad is not None:
+        if parameter.grad is None:
 
-            gradient_count += 1
+            continue
 
-            if not torch.isfinite(
-                parameter.grad
-            ).all():
+        gradient_count += 1
 
-                invalid_gradients += 1
+        if not torch.isfinite(
+            parameter.grad
+        ).all():
+
+            invalid_gradients += 1
 
     print(
-        f"Parameters with gradients : "
+        f"Parameters with grads : "
         f"{gradient_count}"
     )
 
     print(
-        f"Invalid gradients         : "
+        f"Invalid gradients     : "
         f"{invalid_gradients}"
     )
 
@@ -864,6 +816,29 @@ if __name__ == "__main__":
             "Invalid gradients detected."
         )
 
+    print(
+        "Gradient verification : ✅ PASSED"
+    )
+
+    # --------------------------------------------------------
+    # Gradient clipping
+    # --------------------------------------------------------
+
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        config.gradient_clip,
+    )
+
+    print(
+        f"Gradient Norm         : "
+        f"{gradient_norm.item():.6f}"
+    )
+
+    print(
+        f"Gradient Clip         : "
+        f"{config.gradient_clip}"
+    )
+
     # --------------------------------------------------------
     # Optimizer step
     # --------------------------------------------------------
@@ -871,7 +846,7 @@ if __name__ == "__main__":
     optimizer.step()
 
     print(
-        "Optimizer step            : ✅ PASSED"
+        "Optimizer step        : ✅ PASSED"
     )
 
     # --------------------------------------------------------

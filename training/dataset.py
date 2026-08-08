@@ -3,55 +3,88 @@
 MyGPT2 - Training Dataset
 ============================================================
 
-This module converts raw text documents into GPT training
-samples.
+Purpose
+-------
+Converts the project's text datasets into training samples
+for the MyGPT2 language model.
 
 Pipeline:
 
-Raw Documents
-      |
-      v
-MyGPTTokenizer
-      |
-      v
-Token IDs
-      |
-      v
-Fixed-length sequences
-      |
-      v
-Input IDs + Target IDs
-      |
-      v
-PyTorch Dataset
+    Raw Dataset
+        |
+        v
+    Text Documents
+        |
+        v
+    MyGPTTokenizer
+        |
+        v
+    Token IDs
+        |
+        v
+    Fixed-Length Sequences
+        |
+        v
+    Input IDs + Target IDs
+        |
+        v
+    PyTorch Dataset
+        |
+        v
+    DataLoader
 
 For autoregressive language modeling:
 
-Input:
-    [t1, t2, t3, t4, t5]
+    Input:
+        [t1, t2, t3, t4]
 
-Target:
-    [t2, t3, t4, t5, t6]
+    Target:
+        [t2, t3, t4, t5]
 
-The model therefore learns to predict the next token.
+The model learns to predict the next token.
 
 ============================================================
 """
 
 from __future__ import annotations
 
+# ============================================================
+# Standard Library
+# ============================================================
+
+import sys
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
+
+
+# ============================================================
+# Project Root
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ============================================================
+# Third-Party
+# ============================================================
 
 import torch
 from torch.utils.data import IterableDataset
 
 
 # ============================================================
-# Project Paths
+# Project Imports
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from tokenizer.my_tokenizer import MyGPTTokenizer
+
+
+# ============================================================
+# Paths
+# ============================================================
 
 TOKENIZER_PATH = (
     PROJECT_ROOT
@@ -62,7 +95,7 @@ TOKENIZER_PATH = (
 
 
 # ============================================================
-# Dataset Configuration
+# Dataset Paths
 # ============================================================
 
 DEFAULT_DATASETS = {
@@ -97,39 +130,48 @@ DEFAULT_DATASETS = {
 
 
 # ============================================================
-# GPT Training Dataset
+# GPT Text Dataset
 # ============================================================
 
 class GPTTextDataset(IterableDataset):
     """
-    Iterable dataset for GPT language-model training.
+    Iterable dataset used for GPT training.
 
-    Documents are read one at a time and converted into
-    fixed-length token sequences.
+    Documents are loaded one at a time.
+
+    Each document is:
+
+        text
+          ↓
+        tokenizer
+          ↓
+        token IDs
+          ↓
+        fixed-length chunks
+          ↓
+        input / target tensors
 
     Parameters
     ----------
     dataset_paths:
-        Dataset directories.
+        Paths to Hugging Face datasets saved with
+        `save_to_disk()`.
 
     tokenizer:
-        MyGPTTokenizer instance.
+        Instance of MyGPTTokenizer.
 
     sequence_length:
-        Number of tokens provided to the model.
+        Number of tokens used as model input.
 
     max_documents:
-        Optional maximum number of documents to process.
+        Optional limit for testing.
 
-        None means process all available documents.
+        None means process all documents.
 
     stride:
         Distance between consecutive windows.
 
-        If None, defaults to sequence_length.
-
-    add_special_tokens:
-        Whether tokenizer should add BOS/EOS tokens.
+        If None, sequence_length is used.
 
     """
 
@@ -138,11 +180,12 @@ class GPTTextDataset(IterableDataset):
         dataset_paths: Optional[
             Sequence[Path]
         ] = None,
-        tokenizer=None,
+        tokenizer: Optional[
+            MyGPTTokenizer
+        ] = None,
         sequence_length: int = 512,
         max_documents: Optional[int] = None,
         stride: Optional[int] = None,
-        add_special_tokens: bool = True,
     ) -> None:
 
         super().__init__()
@@ -160,7 +203,13 @@ class GPTTextDataset(IterableDataset):
         if tokenizer is None:
 
             raise ValueError(
-                "A tokenizer must be provided."
+                "A MyGPTTokenizer instance must be provided."
+            )
+
+        if not tokenizer.is_loaded:
+
+            raise RuntimeError(
+                "The tokenizer is not loaded."
             )
 
         # ----------------------------------------------------
@@ -198,10 +247,6 @@ class GPTTextDataset(IterableDataset):
             else sequence_length
         )
 
-        self.add_special_tokens = (
-            add_special_tokens
-        )
-
         # ----------------------------------------------------
         # Runtime statistics
         # ----------------------------------------------------
@@ -233,16 +278,16 @@ class GPTTextDataset(IterableDataset):
         self.tokens_generated = 0
 
     # ========================================================
-    # Read Dataset
+    # Load Dataset
     # ========================================================
 
-    def _load_dataset(self, dataset_path: Path):
-
+    def _load_dataset(
+        self,
+        dataset_path: Path,
+    ):
         """
-        Load a Hugging Face dataset from disk.
-
-        The dataset was previously saved using
-        datasets.save_to_disk().
+        Load a dataset saved with Hugging Face
+        `save_to_disk()`.
         """
 
         from datasets import load_from_disk
@@ -266,9 +311,8 @@ class GPTTextDataset(IterableDataset):
     def _extract_text(
         record: dict,
     ) -> str:
-
         """
-        Extract the text field from a dataset record.
+        Extract the `text` field from a dataset record.
         """
 
         text = record.get(
@@ -290,121 +334,79 @@ class GPTTextDataset(IterableDataset):
         return text.strip()
 
     # ========================================================
-    # Tokenize Document
+    # Tokenize
     # ========================================================
 
     def _tokenize(
         self,
         text: str,
     ) -> list[int]:
-
         """
-        Convert text into token IDs.
-
-        This function supports the custom MyGPTTokenizer
-        wrapper.
-
-        Expected tokenizer API:
-
-            tokenizer.encode(text)
-
-        It may return:
-
-            list[int]
-
-        or an object containing:
-
-            .ids
+        Convert text to token IDs using MyGPTTokenizer.
         """
 
-        encoded = self.tokenizer.encode(
-            text,
-            add_special_tokens=(
-                self.add_special_tokens
-            ),
+        token_ids = (
+            self.tokenizer.encode(
+                text
+            )
         )
 
-        # ----------------------------------------------------
-        # Direct list output
-        # ----------------------------------------------------
-
-        if isinstance(
-            encoded,
+        if not isinstance(
+            token_ids,
             list,
         ):
 
-            return [
-                int(token)
-                for token in encoded
-            ]
+            raise TypeError(
+                "MyGPTTokenizer.encode() "
+                "must return list[int]."
+            )
 
-        # ----------------------------------------------------
-        # Hugging Face Encoding object
-        # ----------------------------------------------------
-
-        if hasattr(
-            encoded,
-            "ids",
-        ):
-
-            return [
-                int(token)
-                for token in encoded.ids
-            ]
-
-        # ----------------------------------------------------
-        # Tensor output
-        # ----------------------------------------------------
-
-        if torch.is_tensor(
-            encoded
-        ):
-
-            return [
-                int(token)
-                for token in encoded.tolist()
-            ]
-
-        raise TypeError(
-            "Unsupported tokenizer output type: "
-            f"{type(encoded)}"
-        )
+        return [
+            int(token)
+            for token in token_ids
+        ]
 
     # ========================================================
-    # Create Training Samples
+    # Create Samples
     # ========================================================
 
     def _create_samples(
         self,
         token_ids: list[int],
     ) -> Iterator[
-        tuple[torch.Tensor, torch.Tensor]
+        tuple[
+            torch.Tensor,
+            torch.Tensor
+        ]
     ]:
-
         """
         Convert token IDs into input/target pairs.
 
         Example:
 
-        Tokens:
+            Tokens:
 
-            [1, 2, 3, 4, 5, 6]
+                [10, 20, 30, 40, 50]
 
-        sequence_length = 4
+            sequence_length = 4
 
-        Input:
+            Input:
 
-            [1, 2, 3, 4]
+                [10, 20, 30, 40]
 
-        Target:
+            Target:
 
-            [2, 3, 4, 5]
+                [20, 30, 40, 50]
 
         """
 
         required_tokens = (
             self.sequence_length + 1
         )
+
+        # ----------------------------------------------------
+        # Document too short
+        # ----------------------------------------------------
 
         if len(token_ids) < required_tokens:
 
@@ -431,17 +433,25 @@ class GPTTextDataset(IterableDataset):
                 start:end
             ]
 
+            # ------------------------------------------------
+            # Ignore incomplete sequence
+            # ------------------------------------------------
+
             if len(chunk) < required_tokens:
 
                 continue
 
-            input_ids = chunk[
-                :-1
-            ]
+            # ------------------------------------------------
+            # Shift by one token
+            # ------------------------------------------------
 
-            target_ids = chunk[
-                1:
-            ]
+            input_ids = chunk[:-1]
+
+            target_ids = chunk[1:]
+
+            # ------------------------------------------------
+            # Convert to tensors
+            # ------------------------------------------------
 
             input_tensor = torch.tensor(
                 input_ids,
@@ -452,6 +462,10 @@ class GPTTextDataset(IterableDataset):
                 target_ids,
                 dtype=torch.long,
             )
+
+            # ------------------------------------------------
+            # Statistics
+            # ------------------------------------------------
 
             self.samples_generated += 1
 
@@ -465,31 +479,45 @@ class GPTTextDataset(IterableDataset):
             )
 
     # ========================================================
-    # Iterate Dataset
+    # Iterator
     # ========================================================
 
     def __iter__(
         self,
     ) -> Iterator[
-        tuple[torch.Tensor, torch.Tensor]
+        tuple[
+            torch.Tensor,
+            torch.Tensor
+        ]
     ]:
+        """
+        Iterate over all datasets and generate
+        GPT training samples.
+        """
 
         self.reset_statistics()
 
         # ----------------------------------------------------
-        # Iterate through datasets
+        # Dataset loop
         # ----------------------------------------------------
 
-        for dataset_path in (
-            self.dataset_paths
+        for dataset_name, dataset_path in (
+            self._dataset_items()
         ):
 
-            dataset = self._load_dataset(
-                dataset_path
+            print(
+                f"\nLoading Dataset: "
+                f"{dataset_name}"
+            )
+
+            dataset = (
+                self._load_dataset(
+                    dataset_path
+                )
             )
 
             # ------------------------------------------------
-            # Handle DatasetDict
+            # DatasetDict
             # ------------------------------------------------
 
             if hasattr(
@@ -509,10 +537,18 @@ class GPTTextDataset(IterableDataset):
                 ]
 
             # ------------------------------------------------
-            # Iterate splits
+            # Split loop
             # ------------------------------------------------
 
             for split_name, split in splits:
+
+                print(
+                    f"  Split: {split_name}"
+                )
+
+                # --------------------------------------------
+                # Record loop
+                # --------------------------------------------
 
                 for record in split:
 
@@ -564,16 +600,23 @@ class GPTTextDataset(IterableDataset):
                         self.documents_skipped += 1
 
                         print(
-                            f"\nWarning: tokenizer "
-                            f"failed for document "
-                            f"{self.documents_seen}: "
-                            f"{exc}"
+                            "\nWarning: tokenizer "
+                            "failed."
+                        )
+
+                        print(
+                            f"Document: "
+                            f"{self.documents_seen}"
+                        )
+
+                        print(
+                            f"Error: {exc}"
                         )
 
                         continue
 
                     # ----------------------------------------
-                    # Empty token sequence
+                    # Empty tokens
                     # ----------------------------------------
 
                     if not token_ids:
@@ -592,9 +635,30 @@ class GPTTextDataset(IterableDataset):
                     # Generate samples
                     # ----------------------------------------
 
-                    yield from self._create_samples(
-                        token_ids
+                    yield from (
+                        self._create_samples(
+                            token_ids
+                        )
                     )
+
+    # ========================================================
+    # Dataset Items
+    # ========================================================
+
+    def _dataset_items(self):
+
+        for name, path in DEFAULT_DATASETS.items():
+
+            if path.exists():
+
+                yield name, path
+
+            else:
+
+                print(
+                    f"\nWarning: dataset not found:"
+                    f"\n{path}"
+                )
 
     # ========================================================
     # Statistics
@@ -626,14 +690,13 @@ class GPTTextDataset(IterableDataset):
 # ============================================================
 
 def create_training_dataset(
-    tokenizer,
+    tokenizer: MyGPTTokenizer,
     sequence_length: int = 512,
     max_documents: Optional[int] = None,
     stride: Optional[int] = None,
 ) -> GPTTextDataset:
-
     """
-    Convenience function for creating the GPT dataset.
+    Create the default MyGPT2 training dataset.
     """
 
     return GPTTextDataset(
@@ -648,7 +711,7 @@ def create_training_dataset(
 
 
 # ============================================================
-# Module Test
+# Test
 # ============================================================
 
 if __name__ == "__main__":
@@ -664,26 +727,15 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Import tokenizer
+    # Verify tokenizer file
     # --------------------------------------------------------
 
-    try:
+    if not TOKENIZER_PATH.exists():
 
-        from tokenizer.tokenizer import (
-            MyGPTTokenizer
+        raise FileNotFoundError(
+            "Tokenizer file not found:\n"
+            f"{TOKENIZER_PATH}"
         )
-
-    except ImportError as exc:
-
-        print(
-            "Could not import MyGPTTokenizer."
-        )
-
-        print(
-            f"Error: {exc}"
-        )
-
-        raise SystemExit(1)
 
     # --------------------------------------------------------
     # Load tokenizer
@@ -693,19 +745,25 @@ if __name__ == "__main__":
         "Loading tokenizer..."
     )
 
-    tokenizer = MyGPTTokenizer(
-        str(TOKENIZER_PATH)
+    tokenizer = (
+        MyGPTTokenizer.load(
+            TOKENIZER_PATH
+        )
     )
 
     print(
-        f"Tokenizer vocabulary size: "
-        f"{tokenizer.vocab_size:,}"
+        f"Tokenizer loaded successfully."
+    )
+
+    print(
+        f"Vocabulary Size : "
+        f"{tokenizer.vocabulary_size:,}"
     )
 
     print()
 
     # --------------------------------------------------------
-    # Create small test dataset
+    # Create test dataset
     # --------------------------------------------------------
 
     dataset = create_training_dataset(
@@ -715,15 +773,15 @@ if __name__ == "__main__":
     )
 
     print(
-        "Testing dataset with:"
+        "Dataset configuration:"
     )
 
     print(
-        "  Sequence length : 32"
+        "  Sequence Length : 32"
     )
 
     print(
-        "  Maximum documents : 20"
+        "  Max Documents   : 20"
     )
 
     print()
@@ -743,12 +801,12 @@ if __name__ == "__main__":
         )
 
         print(
-            f"Input shape  : "
+            f"Input Shape  : "
             f"{tuple(input_ids.shape)}"
         )
 
         print(
-            f"Target shape : "
+            f"Target Shape : "
             f"{tuple(target_ids.shape)}"
         )
 
@@ -776,21 +834,15 @@ if __name__ == "__main__":
 
     print()
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         "Dataset Test Summary"
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
-    stats = (
-        dataset.get_statistics()
-    )
+    stats = dataset.get_statistics()
 
     for key, value in stats.items():
 
@@ -801,9 +853,7 @@ if __name__ == "__main__":
     print()
 
     print(
-        "Dataset test completed."
+        "Dataset test completed successfully."
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)

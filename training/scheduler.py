@@ -3,42 +3,21 @@
 MyGPT2 - Learning Rate Scheduler
 ============================================================
 
-Purpose
--------
-Controls the learning rate during GPT-2 training.
+Learning-rate schedule:
 
-Schedule:
-    1. Linear Warmup
-    2. Cosine Decay
+    Linear Warmup
+          ↓
+    Maximum Learning Rate
+          ↓
+    Cosine Decay
+          ↓
+    Minimum Learning Rate
 
-Training flow:
+Default configuration:
 
-    Learning Rate
-          ^
-          |
-          |          /\
-          |         /  \
-          |        /    \
-          |       /      \
-          |      /        \
-          |_____/          \________
-          |
-          +--------------------------> Training Steps
-             Warmup      Cosine Decay
-
-Why warmup?
------------
-At the beginning of training, model weights are still
-randomly initialized. Starting immediately at the maximum
-learning rate can produce unstable gradients.
-
-Warmup gradually increases the learning rate.
-
-Why cosine decay?
------------------
-After warmup, the learning rate gradually decreases,
-allowing the model to make smaller and more precise updates
-as training progresses.
+    Base LR        : 3e-4
+    Warmup Ratio   : 5%
+    Minimum LR     : 10% of base LR
 
 ============================================================
 """
@@ -48,6 +27,11 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
+
+import torch
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
 
 
 # ============================================================
@@ -61,17 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ============================================================
-# PyTorch
-# ============================================================
-
-import torch
-
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR
-
-
-# ============================================================
-# Default Scheduler Configuration
+# Defaults
 # ============================================================
 
 DEFAULT_WARMUP_RATIO = 0.05
@@ -89,36 +63,17 @@ def create_lr_lambda(
     min_lr_ratio: float = DEFAULT_MIN_LR_RATIO,
 ):
     """
-    Create the learning-rate function used by LambdaLR.
+    Create the learning-rate multiplier.
 
-    Parameters
-    ----------
-    warmup_steps:
-        Number of warmup optimization steps.
+    The returned value is a MULTIPLIER.
 
-    total_steps:
-        Total number of optimization steps.
+    Example:
 
-    min_lr_ratio:
-        Final learning rate as a fraction of the initial
-        learning rate.
+        base LR = 0.0003
+        multiplier = 1.0
 
-        Example:
-
-            initial LR = 3e-4
-            min_lr_ratio = 0.1
-
-            final LR = 3e-5
-
-    Returns
-    -------
-    callable
-        Lambda function used by LambdaLR.
+        actual LR = 0.0003
     """
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
 
     if warmup_steps < 0:
         raise ValueError(
@@ -132,47 +87,43 @@ def create_lr_lambda(
 
     if warmup_steps > total_steps:
         raise ValueError(
-            "warmup_steps cannot be greater than total_steps."
+            "warmup_steps cannot exceed total_steps."
         )
 
-    if not (
-        0.0 <= min_lr_ratio <= 1.0
-    ):
+    if not 0.0 <= min_lr_ratio <= 1.0:
         raise ValueError(
             "min_lr_ratio must be between 0 and 1."
         )
 
-    # --------------------------------------------------------
-    # Lambda function
-    # --------------------------------------------------------
-
-    def lr_lambda(current_step: int) -> float:
+    def lr_lambda(
+        current_step: int,
+    ) -> float:
 
         # ====================================================
         # Warmup
         # ====================================================
 
-        if warmup_steps > 0:
+        if (
+            warmup_steps > 0
+            and current_step < warmup_steps
+        ):
 
-            if current_step < warmup_steps:
-
-                return float(
-                    current_step + 1
-                ) / float(
-                    warmup_steps
-                )
+            return (
+                float(current_step + 1)
+                / float(warmup_steps)
+            )
 
         # ====================================================
-        # After warmup
+        # No decay region
         # ====================================================
 
         if total_steps <= warmup_steps:
 
             return min_lr_ratio
 
-        # ----------------------------------------------------
-        # Progress through cosine decay
-        # ----------------------------------------------------
+        # ====================================================
+        # Cosine decay progress
+        # ====================================================
 
         progress = (
             current_step - warmup_steps
@@ -188,9 +139,9 @@ def create_lr_lambda(
             ),
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Cosine decay
-        # ----------------------------------------------------
+        # ====================================================
 
         cosine_decay = (
             0.5
@@ -202,9 +153,9 @@ def create_lr_lambda(
             )
         )
 
-        # ----------------------------------------------------
-        # Apply minimum learning rate
-        # ----------------------------------------------------
+        # ====================================================
+        # Minimum LR
+        # ====================================================
 
         return (
             min_lr_ratio
@@ -230,48 +181,21 @@ def create_scheduler(
     min_lr_ratio: float = DEFAULT_MIN_LR_RATIO,
 ) -> LambdaLR:
     """
-    Create a linear-warmup + cosine-decay scheduler.
-
-    Parameters
-    ----------
-    optimizer:
-        AdamW optimizer.
-
-    total_steps:
-        Total number of optimizer updates.
-
-    warmup_steps:
-        Explicit warmup steps.
-
-        If None, warmup_ratio is used.
-
-    warmup_ratio:
-        Fraction of training used for warmup.
-
-    min_lr_ratio:
-        Final LR / initial LR.
-
-    Returns
-    -------
-    torch.optim.lr_scheduler.LambdaLR
+    Create a Linear Warmup + Cosine Decay scheduler.
     """
 
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
-
     if total_steps <= 0:
-
         raise ValueError(
             "total_steps must be greater than zero."
         )
 
+    # --------------------------------------------------------
+    # Calculate warmup steps
+    # --------------------------------------------------------
+
     if warmup_steps is None:
 
-        if not (
-            0.0 <= warmup_ratio <= 1.0
-        ):
-
+        if not 0.0 <= warmup_ratio <= 1.0:
             raise ValueError(
                 "warmup_ratio must be between 0 and 1."
             )
@@ -285,19 +209,28 @@ def create_scheduler(
         )
 
     if warmup_steps < 0:
-
         raise ValueError(
             "warmup_steps cannot be negative."
         )
 
     if warmup_steps > total_steps:
-
         raise ValueError(
             "warmup_steps cannot exceed total_steps."
         )
 
     # --------------------------------------------------------
-    # Create LR function
+    # IMPORTANT:
+    #
+    # Save the original/base LR BEFORE LambdaLR changes it.
+    # --------------------------------------------------------
+
+    base_learning_rates = [
+        float(group["lr"])
+        for group in optimizer.param_groups
+    ]
+
+    # --------------------------------------------------------
+    # Create lambda
     # --------------------------------------------------------
 
     lr_lambda = create_lr_lambda(
@@ -315,6 +248,15 @@ def create_scheduler(
         lr_lambda=lr_lambda,
     )
 
+    # --------------------------------------------------------
+    # Restore base learning rates.
+    #
+    # This makes the configured learning rate the actual
+    # maximum learning rate.
+    # --------------------------------------------------------
+
+    scheduler.base_lrs = base_learning_rates
+
     return scheduler
 
 
@@ -325,9 +267,6 @@ def create_scheduler(
 def get_learning_rate(
     optimizer: Optimizer,
 ) -> float:
-    """
-    Return the learning rate of the first optimizer group.
-    """
 
     if not optimizer.param_groups:
 
@@ -347,31 +286,23 @@ def get_learning_rate(
 def get_all_learning_rates(
     optimizer: Optimizer,
 ) -> list[float]:
-    """
-    Return learning rates from every optimizer group.
-    """
 
     return [
-        float(
-            group["lr"]
-        )
-        for group
-        in optimizer.param_groups
+        float(group["lr"])
+        for group in optimizer.param_groups
     ]
 
 
 # ============================================================
-# Scheduler Information
+# Get Scheduler Information
 # ============================================================
 
 def get_scheduler_info(
     scheduler: LambdaLR,
 ) -> dict:
-    """
-    Return useful scheduler information.
-    """
 
     return {
+
         "last_epoch":
             scheduler.last_epoch,
 
@@ -384,28 +315,20 @@ def get_scheduler_info(
             list(
                 scheduler.get_last_lr()
             ),
+
     }
 
 
 # ============================================================
-# Preview Learning Rate Schedule
+# Preview Schedule
 # ============================================================
 
 def preview_schedule(
     optimizer: Optimizer,
     scheduler: LambdaLR,
     total_steps: int,
-    points: int = 10,
+    points: int = 12,
 ) -> list[tuple[int, float]]:
-    """
-    Preview selected points from the learning-rate schedule.
-
-    This does not modify the optimizer or scheduler.
-
-    Returns:
-        List of:
-            (step, learning_rate)
-    """
 
     if total_steps <= 0:
 
@@ -419,40 +342,43 @@ def preview_schedule(
             "points must be at least 2."
         )
 
-    base_lr = optimizer.param_groups[0]["lr"]
-
     # --------------------------------------------------------
-    # Recover lambda function
+    # IMPORTANT:
+    #
+    # Use scheduler.base_lrs, NOT the optimizer's current LR.
+    #
+    # The optimizer LR may already contain the warmup
+    # multiplier.
     # --------------------------------------------------------
 
-    lr_function = scheduler.lr_lambdas[0]
+    base_learning_rate = (
+        scheduler.base_lrs[0]
+    )
+
+    lr_function = (
+        scheduler.lr_lambdas[0]
+    )
 
     results = []
 
     for index in range(points):
 
-        if points == 1:
-
-            step = 0
-
-        else:
-
-            step = int(
-                index
-                * (
-                    total_steps - 1
-                )
-                / (
-                    points - 1
-                )
+        step = int(
+            index
+            * (
+                total_steps - 1
             )
+            / (
+                points - 1
+            )
+        )
 
         multiplier = lr_function(
             step
         )
 
         learning_rate = (
-            base_lr
+            base_learning_rate
             * multiplier
         )
 
@@ -472,45 +398,27 @@ def preview_schedule(
 
 if __name__ == "__main__":
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         "MyGPT2 Learning Rate Scheduler Test"
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print()
 
     # --------------------------------------------------------
-    # Import configuration
+    # Imports
     # --------------------------------------------------------
 
     from model.config import GPTConfig
 
-    # --------------------------------------------------------
-    # Import model
-    # --------------------------------------------------------
+    from model.model import MyGPTModel
 
-    try:
-
-        from model.model import MyGPTModel
-
-    except ImportError as exc:
-
-        print(
-            "Could not import MyGPTModel."
-        )
-
-        print(
-            f"Error: {exc}"
-        )
-
-        raise
+    from training.optimizer import (
+        create_optimizer,
+    )
 
     # --------------------------------------------------------
     # Device
@@ -548,7 +456,7 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Configuration
+    # Config
     # --------------------------------------------------------
 
     config = GPTConfig()
@@ -571,7 +479,7 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Create model
+    # Model
     # --------------------------------------------------------
 
     print(
@@ -580,11 +488,7 @@ if __name__ == "__main__":
 
     model = MyGPTModel(
         config
-    )
-
-    model = model.to(
-        device
-    )
+    ).to(device)
 
     model.train()
 
@@ -595,18 +499,11 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Create optimizer
+    # Optimizer
     # --------------------------------------------------------
 
     print(
         "Creating optimizer..."
-    )
-
-    # Use the optimizer implementation
-    # already created for MyGPT2.
-
-    from training.optimizer import (
-        create_optimizer,
     )
 
     optimizer = create_optimizer(
@@ -629,13 +526,13 @@ if __name__ == "__main__":
 
     test_warmup_steps = 100
 
+    min_lr_ratio = 0.10
+
     print(
         "Scheduler Configuration"
     )
 
-    print(
-        "-" * 70
-    )
+    print("-" * 70)
 
     print(
         f"Total Steps         : "
@@ -654,13 +551,13 @@ if __name__ == "__main__":
 
     print(
         f"Minimum LR Ratio    : "
-        f"{DEFAULT_MIN_LR_RATIO}"
+        f"{min_lr_ratio}"
     )
 
     print()
 
     # --------------------------------------------------------
-    # Create scheduler
+    # Scheduler
     # --------------------------------------------------------
 
     print(
@@ -671,7 +568,7 @@ if __name__ == "__main__":
         optimizer=optimizer,
         total_steps=test_total_steps,
         warmup_steps=test_warmup_steps,
-        min_lr_ratio=DEFAULT_MIN_LR_RATIO,
+        min_lr_ratio=min_lr_ratio,
     )
 
     print(
@@ -681,11 +578,18 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Initial LR
+    # Base LR
     # --------------------------------------------------------
 
+    base_lr = scheduler.base_lrs[0]
+
     print(
-        f"Initial Learning Rate : "
+        f"Base Learning Rate   : "
+        f"{base_lr:.10f}"
+    )
+
+    print(
+        f"Current Learning Rate : "
         f"{get_learning_rate(optimizer):.10f}"
     )
 
@@ -699,9 +603,7 @@ if __name__ == "__main__":
         "Learning Rate Schedule Preview"
     )
 
-    print(
-        "-" * 70
-    )
+    print("-" * 70)
 
     preview = preview_schedule(
         optimizer=optimizer,
@@ -720,18 +622,66 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
+    # Expected values
+    # --------------------------------------------------------
+
+    expected_max_lr = (
+        config.learning_rate
+    )
+
+    expected_min_lr = (
+        config.learning_rate
+        * min_lr_ratio
+    )
+
+    final_lr = preview[-1][1]
+
+    print(
+        f"Expected Maximum LR  : "
+        f"{expected_max_lr:.10f}"
+    )
+
+    print(
+        f"Expected Minimum LR  : "
+        f"{expected_min_lr:.10f}"
+    )
+
+    print(
+        f"Final Preview LR     : "
+        f"{final_lr:.10f}"
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # Verify maximum LR
+    # --------------------------------------------------------
+
+    if not math.isclose(
+        base_lr,
+        expected_max_lr,
+        rel_tol=1e-6,
+    ):
+
+        raise RuntimeError(
+            "Base learning rate is incorrect."
+        )
+
+    print(
+        "Base LR verification : ✅ PASSED"
+    )
+
+    # --------------------------------------------------------
     # Verify warmup
     # --------------------------------------------------------
 
-    warmup_lr_start = (
-        preview[0][1]
-    )
+    warmup_start = preview[0][1]
 
-    warmup_lr_end = (
+    warmup_end = (
         preview[1][1]
     )
 
-    if warmup_lr_end <= warmup_lr_start:
+    if warmup_end <= warmup_start:
 
         raise RuntimeError(
             "Learning rate did not increase "
@@ -739,57 +689,34 @@ if __name__ == "__main__":
         )
 
     print(
-        "Warmup behavior       : ✅ PASSED"
+        "Warmup behavior      : ✅ PASSED"
     )
 
     # --------------------------------------------------------
-    # Verify final decay
+    # Verify final LR
     # --------------------------------------------------------
 
-    final_lr = preview[-1][1]
-
-    initial_lr = config.learning_rate
-
-    minimum_lr = (
-        initial_lr
-        * DEFAULT_MIN_LR_RATIO
-    )
-
-    if final_lr > initial_lr:
+    if final_lr > expected_max_lr:
 
         raise RuntimeError(
-            "Final learning rate is greater "
-            "than the initial learning rate."
+            "Final LR is greater than maximum LR."
+        )
+
+    if final_lr < expected_min_lr * 0.999:
+
+        raise RuntimeError(
+            "Final LR is below configured minimum."
         )
 
     print(
-        "Cosine decay behavior : ✅ PASSED"
+        "Cosine decay         : ✅ PASSED"
     )
 
     # --------------------------------------------------------
-    # Verify minimum LR
+    # Test scheduler stepping
     # --------------------------------------------------------
-
-    print(
-        f"Initial LR            : "
-        f"{initial_lr:.10f}"
-    )
-
-    print(
-        f"Minimum LR            : "
-        f"{minimum_lr:.10f}"
-    )
-
-    print(
-        f"Final Preview LR      : "
-        f"{final_lr:.10f}"
-    )
 
     print()
-
-    # --------------------------------------------------------
-    # Actual scheduler stepping
-    # --------------------------------------------------------
 
     print(
         "Testing scheduler.step()..."
@@ -797,17 +724,11 @@ if __name__ == "__main__":
 
     learning_rates = []
 
-    for step in range(
-        20
-    ):
+    for _ in range(20):
 
         optimizer.zero_grad(
             set_to_none=True
         )
-
-        # ----------------------------------------------------
-        # Create tiny dummy loss
-        # ----------------------------------------------------
 
         dummy_loss = sum(
             parameter.sum() * 0.0
@@ -828,11 +749,11 @@ if __name__ == "__main__":
         )
 
     print(
-        "Scheduler stepping     : ✅ PASSED"
+        "Scheduler stepping    : ✅ PASSED"
     )
 
     # --------------------------------------------------------
-    # Check finite LR
+    # Validate learning rates
     # --------------------------------------------------------
 
     for learning_rate in learning_rates:
@@ -846,11 +767,11 @@ if __name__ == "__main__":
             )
 
     print(
-        "Learning rates valid   : ✅ PASSED"
+        "Learning rates valid  : ✅ PASSED"
     )
 
     # --------------------------------------------------------
-    # Scheduler state
+    # State
     # --------------------------------------------------------
 
     info = get_scheduler_info(
@@ -863,13 +784,16 @@ if __name__ == "__main__":
         "Scheduler State"
     )
 
-    print(
-        "-" * 70
-    )
+    print("-" * 70)
 
     print(
         f"Current Step          : "
         f"{info['last_epoch']}"
+    )
+
+    print(
+        f"Base Learning Rates   : "
+        f"{info['base_learning_rates']}"
     )
 
     print(
@@ -880,17 +804,13 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Final result
+    # Final
     # --------------------------------------------------------
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         "Scheduler test completed successfully."
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)

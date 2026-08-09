@@ -148,7 +148,7 @@ class MyGPTDataLoader:
         stride: Optional[int] = None,
         num_workers: int = DEFAULT_NUM_WORKERS,
         pin_memory: bool = True,
-        drop_last: bool = True,
+        drop_last: bool = False,
     ) -> None:
 
         # ----------------------------------------------------
@@ -309,6 +309,7 @@ def create_dataloader(
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,

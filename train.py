@@ -2000,17 +2000,270 @@ def main() -> None:
 
     if args.max_steps is not None:
 
-        run_short_test(
-            trainer=trainer,
+        target_steps = args.max_steps
 
-            train_loader=train_loader,
+        if target_steps <= 0:
+            raise ValueError(
+                "--max-steps must be greater than zero."
+            )
 
-            max_steps=args.max_steps,
-
-            no_save=args.no_save,
-
-            device=device,
+        print()
+        print("=" * 75)
+        print("Step-Limited Training")
+        print("=" * 75)
+        print(
+            f"Target Steps    : {target_steps:,}"
         )
+        print(
+            "Dataset Cycling : ENABLED"
+        )
+        print(
+            "Checkpointing   : ENABLED"
+            if not args.no_save
+            else
+            "Checkpointing   : DISABLED"
+        )
+        print("=" * 75)
+
+        # --------------------------------------------------------
+        # Create the first iterator
+        # --------------------------------------------------------
+
+        data_iterator = iter(train_loader)
+
+        dataset_pass = 1
+
+        print()
+        print(
+            f"Starting dataset pass {dataset_pass}..."
+        )
+
+        while trainer.global_step < target_steps:
+
+            # ----------------------------------------------------
+            # Get next batch
+            # ----------------------------------------------------
+
+            try:
+
+                batch = next(data_iterator)
+
+            except StopIteration:
+
+                # ------------------------------------------------
+                # Dataset exhausted.
+                #
+                # IMPORTANT:
+                # We do NOT stop training.
+                # We simply start another pass.
+                # ------------------------------------------------
+
+                dataset_pass += 1
+
+                print()
+                print(
+                    "=" * 75
+                )
+
+                print(
+                    "Dataset exhausted."
+                )
+
+                print(
+                    f"Starting dataset pass "
+                    f"{dataset_pass}..."
+                )
+
+                print(
+                    f"Current Step    : "
+                    f"{trainer.global_step:,}"
+                )
+
+                print(
+                    "=" * 75
+                )
+
+                data_iterator = iter(
+                    train_loader
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # Validate batch
+            # ----------------------------------------------------
+
+            if not isinstance(
+                batch,
+                (tuple, list),
+            ):
+
+                raise RuntimeError(
+                    "Training DataLoader must "
+                    "return (input_ids, labels)."
+                )
+
+            if len(batch) != 2:
+
+                raise RuntimeError(
+                    "Training DataLoader batch "
+                    "must contain exactly two tensors."
+                )
+
+            input_ids, labels = batch
+
+            # ----------------------------------------------------
+            # Training step
+            # ----------------------------------------------------
+
+            loss = trainer.train_step(
+                input_ids,
+                labels,
+            )
+
+            # ----------------------------------------------------
+            # Progress
+            # ----------------------------------------------------
+
+            print(
+                f"Step "
+                f"{trainer.global_step:>6} | "
+                f"Loss "
+                f"{loss:.6f} | "
+                f"LR "
+                f"{trainer.get_learning_rate():.8f}"
+            )
+
+            # ----------------------------------------------------
+            # Safety checkpoint
+            #
+            # Save every 1000 steps.
+            #
+            # We use a unique filename so Windows does not have
+            # to replace an existing checkpoint file.
+            # ----------------------------------------------------
+
+            if (
+                not args.no_save
+                and trainer.global_step % 1000 == 0
+            ):
+
+                checkpoint_name = (
+                    f"step_{trainer.global_step:08d}.pt"
+                )
+
+                try:
+
+                    checkpoint_path = trainer.save(
+                        checkpoint_name
+                    )
+
+                    print()
+                    print(
+                        "Checkpoint saved : "
+                        f"{checkpoint_path}"
+                    )
+
+                except Exception as exc:
+
+                    print()
+                    print(
+                        "WARNING: Checkpoint save failed."
+                    )
+
+                    print(
+                        f"Reason          : {exc}"
+                    )
+
+                    print(
+                        "Training will continue."
+                    )
+
+        # --------------------------------------------------------
+        # Final checkpoint
+        # --------------------------------------------------------
+
+        if not args.no_save:
+
+            checkpoint_name = (
+                f"final_step_{trainer.global_step:08d}.pt"
+            )
+
+            try:
+
+                final_checkpoint = trainer.save(
+                    checkpoint_name
+                )
+
+                print()
+                print(
+                    f"Final checkpoint : "
+                    f"{final_checkpoint}"
+                )
+
+            except Exception as exc:
+
+                print()
+                print(
+                    "WARNING: Final checkpoint save failed."
+                )
+
+                print(
+                    f"Reason          : {exc}"
+                )
+
+        # --------------------------------------------------------
+        # Summary
+        # --------------------------------------------------------
+
+        elapsed = (
+            time.time()
+            - start_time
+        )
+
+        print()
+        print("=" * 75)
+        print("Step-Limited Training Completed")
+        print("=" * 75)
+
+        print(
+            f"Steps           : "
+            f"{trainer.global_step:,}"
+        )
+
+        print(
+            f"Target Steps    : "
+            f"{target_steps:,}"
+        )
+
+        print(
+            f"Dataset Passes  : "
+            f"{dataset_pass}"
+        )
+
+        print(
+            f"Final Loss      : "
+            f"{trainer.current_train_loss:.6f}"
+        )
+
+        print(
+            f"Elapsed Time    : "
+            f"{elapsed:.2f}s"
+        )
+
+        if trainer.global_step >= target_steps:
+
+            print(
+                "Status          : ✅ PASSED"
+            )
+
+        else:
+
+            print(
+                "Status          : ⚠️ INCOMPLETE"
+            )
+
+        print("=" * 75)
 
         return
 

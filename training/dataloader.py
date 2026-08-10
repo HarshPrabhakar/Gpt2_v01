@@ -1,7 +1,5 @@
 """
-============================================================
 MyGPT2 - DataLoader
-============================================================
 
 Purpose
 -------
@@ -29,23 +27,17 @@ Pipeline:
         v
     MyGPT2 Model
 
-Example:
 
-    Individual sample:
+Important
+---------
+GPTTextDataset may be implemented as an IterableDataset.
 
-        Input  ->  [512]
-        Target ->  [512]
-
-    Batch:
-
-        Input  ->  [4, 512]
-        Target ->  [4, 512]
-
-============================================================
+PyTorch does not allow shuffle=True with IterableDataset.
+This module therefore detects the dataset type and only
+enables shuffling when the dataset supports it.
 """
 
 from __future__ import annotations
-
 
 # ============================================================
 # Standard Library
@@ -54,7 +46,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Optional
-
 
 # ============================================================
 # Project Root
@@ -65,15 +56,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
 # ============================================================
 # Third-Party
 # ============================================================
 
 import torch
 
-from torch.utils.data import DataLoader
-
+from torch.utils.data import (
+    DataLoader,
+    IterableDataset,
+)
 
 # ============================================================
 # Project Imports
@@ -86,16 +78,85 @@ from training.dataset import (
     DEFAULT_DATASETS,
 )
 
-
 # ============================================================
 # Default Configuration
 # ============================================================
 
 DEFAULT_SEQUENCE_LENGTH = 512
-
 DEFAULT_BATCH_SIZE = 4
-
 DEFAULT_NUM_WORKERS = 0
+
+
+# ============================================================
+# Internal DataLoader Builder
+# ============================================================
+
+def _build_pytorch_loader(
+    dataset,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    drop_last: bool,
+) -> DataLoader:
+    """
+    Build the PyTorch DataLoader.
+
+    Important:
+    ----------
+    IterableDataset does NOT support shuffle=True.
+
+    Therefore:
+
+        IterableDataset
+            -> no shuffle argument
+
+        Map-style Dataset
+            -> shuffle=True
+
+    This prevents:
+
+        ValueError:
+        DataLoader with IterableDataset:
+        expected unspecified shuffle option,
+        but got shuffle=True
+    """
+
+    # --------------------------------------------------------
+    # Common DataLoader arguments
+    # --------------------------------------------------------
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": drop_last,
+    }
+
+    # --------------------------------------------------------
+    # IterableDataset
+    # --------------------------------------------------------
+
+    if isinstance(dataset, IterableDataset):
+
+        # DO NOT pass shuffle=True here.
+        #
+        # PyTorch explicitly rejects shuffle for
+        # IterableDataset.
+
+        return DataLoader(
+            dataset,
+            **loader_kwargs,
+        )
+
+    # --------------------------------------------------------
+    # Map-style Dataset
+    # --------------------------------------------------------
+
+    return DataLoader(
+        dataset,
+        shuffle=True,
+        **loader_kwargs,
+    )
 
 
 # ============================================================
@@ -105,9 +166,6 @@ DEFAULT_NUM_WORKERS = 0
 class MyGPTDataLoader:
     """
     Wrapper around PyTorch DataLoader.
-
-    This class creates the DataLoader used by the
-    MyGPT2 training pipeline.
 
     Parameters
     ----------
@@ -136,7 +194,6 @@ class MyGPTDataLoader:
 
     drop_last:
         Drops incomplete final batch.
-
     """
 
     def __init__(
@@ -156,28 +213,35 @@ class MyGPTDataLoader:
         # ----------------------------------------------------
 
         if not tokenizer.is_loaded:
-
             raise RuntimeError(
                 "Tokenizer must be loaded before "
                 "creating the DataLoader."
             )
 
         if sequence_length < 2:
-
             raise ValueError(
                 "sequence_length must be at least 2."
             )
 
         if batch_size < 1:
-
             raise ValueError(
                 "batch_size must be at least 1."
             )
 
         if num_workers < 0:
-
             raise ValueError(
                 "num_workers cannot be negative."
+            )
+
+        if max_documents is not None and max_documents < 1:
+            raise ValueError(
+                "max_documents must be positive "
+                "when specified."
+            )
+
+        if stride is not None and stride < 1:
+            raise ValueError(
+                "stride must be positive when specified."
             )
 
         # ----------------------------------------------------
@@ -186,27 +250,19 @@ class MyGPTDataLoader:
 
         self.tokenizer = tokenizer
 
-        self.sequence_length = (
-            sequence_length
-        )
+        self.sequence_length = sequence_length
 
         self.batch_size = batch_size
 
-        self.max_documents = (
-            max_documents
-        )
+        self.max_documents = max_documents
 
         self.stride = stride
 
         self.num_workers = num_workers
 
-        self.pin_memory = (
-            pin_memory
-        )
+        self.pin_memory = pin_memory
 
-        self.drop_last = (
-            drop_last
-        )
+        self.drop_last = drop_last
 
         # ----------------------------------------------------
         # Dataset
@@ -226,8 +282,8 @@ class MyGPTDataLoader:
         # DataLoader
         # ----------------------------------------------------
 
-        self.loader = DataLoader(
-            self.dataset,
+        self.loader = _build_pytorch_loader(
+            dataset=self.dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
@@ -239,7 +295,6 @@ class MyGPTDataLoader:
     # ========================================================
 
     def __iter__(self):
-
         return iter(self.loader)
 
     # ========================================================
@@ -247,15 +302,23 @@ class MyGPTDataLoader:
     # ========================================================
 
     def __len__(self):
+        """
+        Return DataLoader length when available.
 
-        return len(self.loader)
+        IterableDataset may not implement __len__.
+        """
+
+        try:
+            return len(self.loader)
+
+        except TypeError:
+            return 0
 
     # ========================================================
     # Get Loader
     # ========================================================
 
     def get_loader(self) -> DataLoader:
-
         return self.loader
 
     # ========================================================
@@ -263,7 +326,6 @@ class MyGPTDataLoader:
     # ========================================================
 
     def get_dataset(self) -> GPTTextDataset:
-
         return self.dataset
 
     # ========================================================
@@ -271,7 +333,6 @@ class MyGPTDataLoader:
     # ========================================================
 
     def get_statistics(self) -> dict:
-
         return self.dataset.get_statistics()
 
 
@@ -292,9 +353,77 @@ def create_dataloader(
     """
     Create and return a PyTorch DataLoader.
 
-    This is the simplest interface for the training
-    pipeline.
+    Parameters
+    ----------
+    tokenizer:
+        Loaded MyGPTTokenizer.
+
+    sequence_length:
+        Number of tokens in each training sequence.
+
+    batch_size:
+        Number of samples per batch.
+
+    max_documents:
+        Maximum number of source documents to consume.
+
+    stride:
+        Token window stride.
+
+    num_workers:
+        PyTorch DataLoader workers.
+
+    pin_memory:
+        Enables pinned CPU memory.
+
+    drop_last:
+        Drops incomplete final batch.
+
+    Returns
+    -------
+    DataLoader
+        Configured PyTorch DataLoader.
     """
+
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
+
+    if not tokenizer.is_loaded:
+        raise RuntimeError(
+            "Tokenizer must be loaded before "
+            "creating the DataLoader."
+        )
+
+    if sequence_length < 2:
+        raise ValueError(
+            "sequence_length must be at least 2."
+        )
+
+    if batch_size < 1:
+        raise ValueError(
+            "batch_size must be at least 1."
+        )
+
+    if num_workers < 0:
+        raise ValueError(
+            "num_workers cannot be negative."
+        )
+
+    if max_documents is not None and max_documents < 1:
+        raise ValueError(
+            "max_documents must be positive "
+            "when specified."
+        )
+
+    if stride is not None and stride < 1:
+        raise ValueError(
+            "stride must be positive when specified."
+        )
+
+    # --------------------------------------------------------
+    # Create Dataset
+    # --------------------------------------------------------
 
     dataset = GPTTextDataset(
         dataset_paths=list(
@@ -306,10 +435,13 @@ def create_dataloader(
         stride=stride,
     )
 
-    loader = DataLoader(
-        dataset,
+    # --------------------------------------------------------
+    # Create DataLoader
+    # --------------------------------------------------------
+
+    loader = _build_pytorch_loader(
+        dataset=dataset,
         batch_size=batch_size,
-        shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,
@@ -368,19 +500,55 @@ def move_batch_to_device(
 
 
 # ============================================================
+# DataLoader Information Helper
+# ============================================================
+
+def get_dataloader_info(
+    loader: DataLoader,
+) -> dict:
+    """
+    Return useful DataLoader information.
+
+    This helper is especially useful for IterableDataset,
+    where len(loader) may not be available.
+    """
+
+    dataset = loader.dataset
+
+    info = {
+        "dataset_type": type(dataset).__name__,
+        "is_iterable_dataset": isinstance(
+            dataset,
+            IterableDataset,
+        ),
+        "batch_size": loader.batch_size,
+        "num_workers": loader.num_workers,
+        "pin_memory": loader.pin_memory,
+        "drop_last": loader.drop_last,
+    }
+
+    # --------------------------------------------------------
+    # Try to determine number of batches
+    # --------------------------------------------------------
+
+    try:
+        info["num_batches"] = len(loader)
+
+    except TypeError:
+        info["num_batches"] = None
+
+    return info
+
+
+# ============================================================
 # Test
 # ============================================================
 
 if __name__ == "__main__":
 
     print("=" * 70)
-
-    print(
-        "MyGPT2 DataLoader Test"
-    )
-
+    print("MyGPT2 DataLoader Test")
     print("=" * 70)
-
     print()
 
     # --------------------------------------------------------
@@ -389,13 +557,9 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
 
-        device = torch.device(
-            "cuda"
-        )
+        device = torch.device("cuda")
 
-        print(
-            "CUDA available : YES"
-        )
+        print("CUDA available : YES")
 
         print(
             f"GPU            : "
@@ -404,13 +568,9 @@ if __name__ == "__main__":
 
     else:
 
-        device = torch.device(
-            "cpu"
-        )
+        device = torch.device("cpu")
 
-        print(
-            "CUDA available : NO"
-        )
+        print("CUDA available : NO")
 
         print(
             "Running DataLoader test on CPU."
@@ -440,14 +600,10 @@ if __name__ == "__main__":
     # Load tokenizer
     # --------------------------------------------------------
 
-    print(
-        "Loading tokenizer..."
-    )
+    print("Loading tokenizer...")
 
-    tokenizer = (
-        MyGPTTokenizer.load(
-            tokenizer_path
-        )
+    tokenizer = MyGPTTokenizer.load(
+        tokenizer_path
     )
 
     print(
@@ -518,6 +674,24 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
+    # DataLoader information
+    # --------------------------------------------------------
+
+    info = get_dataloader_info(loader)
+
+    print("=" * 70)
+    print("DataLoader Information")
+    print("=" * 70)
+
+    for key, value in info.items():
+
+        print(
+            f"{key:25}: {value}"
+        )
+
+    print()
+
+    # --------------------------------------------------------
     # Get first batch
     # --------------------------------------------------------
 
@@ -525,9 +699,19 @@ if __name__ == "__main__":
         "Loading first batch..."
     )
 
-    batch = next(
-        iter(loader)
-    )
+    try:
+
+        batch = next(
+            iter(loader)
+        )
+
+    except StopIteration:
+
+        raise RuntimeError(
+            "DataLoader produced no batches.\n"
+            "Increase max_documents or verify "
+            "the dataset contents."
+        )
 
     input_ids, target_ids = (
         move_batch_to_device(
@@ -543,11 +727,7 @@ if __name__ == "__main__":
     print()
 
     print("=" * 70)
-
-    print(
-        "First Batch"
-    )
-
+    print("First Batch")
     print("=" * 70)
 
     print(
@@ -624,11 +804,7 @@ if __name__ == "__main__":
     )
 
     print("=" * 70)
-
-    print(
-        "Validation"
-    )
-
+    print("Validation")
     print("=" * 70)
 
     if actual_input_shape == expected_shape:
@@ -653,6 +829,34 @@ if __name__ == "__main__":
 
         print(
             "Target Shape : ❌ Incorrect"
+        )
+
+    # --------------------------------------------------------
+    # Verify dtype
+    # --------------------------------------------------------
+
+    if input_ids.dtype == torch.long:
+
+        print(
+            "Input DType   : ✅ Correct"
+        )
+
+    else:
+
+        print(
+            "Input DType   : ❌ Incorrect"
+        )
+
+    if target_ids.dtype == torch.long:
+
+        print(
+            "Target DType  : ✅ Correct"
+        )
+
+    else:
+
+        print(
+            "Target DType  : ❌ Incorrect"
         )
 
     # --------------------------------------------------------
@@ -735,29 +939,34 @@ if __name__ == "__main__":
     # --------------------------------------------------------
 
     print("=" * 70)
-
-    print(
-        "Dataset Statistics"
-    )
-
+    print("Dataset Statistics")
     print("=" * 70)
 
-    stats = (
-        loader.dataset.get_statistics()
-    )
+    try:
 
-    for key, value in stats.items():
+        stats = loader.dataset.get_statistics()
+
+        for key, value in stats.items():
+
+            print(
+                f"{key:25}: {value:,}"
+            )
+
+    except AttributeError:
 
         print(
-            f"{key:25}: {value:,}"
+            "Dataset statistics are not available."
         )
 
     print()
 
-    print("=" * 70)
+    # --------------------------------------------------------
+    # Final result
+    # --------------------------------------------------------
 
+    print("=" * 70)
     print(
         "DataLoader test completed successfully."
     )
-
     print("=" * 70)
+

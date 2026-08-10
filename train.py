@@ -681,69 +681,39 @@ def import_dataloader_factory():
 # ============================================================
 
 def create_train_loader(
-    *,
-    config: GPTConfig,
-    tokenizer: MyGPTTokenizer,
-    max_documents: int | None,
-    num_workers: int,
+    config,
+    tokenizer,
+    max_documents=None,
+    num_workers=0,
 ):
     """
-    Create the real training DataLoader.
-
-    This function matches the actual DataLoader API:
-
-        create_dataloader(
-            tokenizer=...,
-            sequence_length=...,
-            batch_size=...,
-            max_documents=...,
-            num_workers=...,
-            pin_memory=...,
-            drop_last=...
-        )
+    Create the training DataLoader using the actual
+    training.dataloader.create_dataloader() API.
     """
 
-    factory = (
-        import_dataloader_factory()
-    )
+    factory = import_dataloader_factory()
 
-    print()
-    print(
-        "Creating training DataLoader..."
-    )
-
-    loader = factory(
-        tokenizer=tokenizer,
-
-        sequence_length=(
-            config.max_position_embeddings
-        ),
-
-        batch_size=(
-            config.batch_size
-        ),
-
-        max_documents=max_documents,
-
-        num_workers=num_workers,
-
-        pin_memory=(
-            torch.cuda.is_available()
-        ),
-
-        drop_last=True,
-    )
-
-    if loader is None:
-
-        raise RuntimeError(
-            "DataLoader factory returned None."
+    try:
+        loader = factory(
+            tokenizer=tokenizer,
+            sequence_length=config.max_position_embeddings,
+            batch_size=config.batch_size,
+            max_documents=max_documents,
+            num_workers=num_workers,
+            pin_memory=(config.device == "cuda"),
+            drop_last=True,
         )
 
-    print(
-        "Training DataLoader "
-        "created successfully."
-    )
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to create the training DataLoader.\n\n"
+            f"Error: {exc}"
+        ) from exc
+
+    if loader is None:
+        raise RuntimeError(
+            "create_dataloader() returned None."
+        )
 
     return loader
 

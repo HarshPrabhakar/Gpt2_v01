@@ -1,1 +1,24 @@
 datasets/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.tmp
+
+# Training artifacts
+artifacts/checkpoints/
+artifacts/logs/
+
+# Hugging Face / dataset cache
+.cache/
+.cache/
+huggingface/

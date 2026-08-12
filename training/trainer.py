@@ -7,32 +7,37 @@ Purpose
 -------
 Main training loop for MyGPT2.
 
-This module connects:
+Supports:
 
-    Dataset
-        ↓
-    DataLoader
-        ↓
-    GPT Model
-        ↓
-    Forward Pass
-        ↓
-    Loss
-        ↓
-    Backward Pass
-        ↓
-    Gradient Clipping
-        ↓
-    AdamW
-        ↓
-    Learning Rate Scheduler
-        ↓
-    Checkpointing
+    • Step-based training
+    • Epoch-based training
+    • IterableDataset / DataLoader
+    • Automatic DataLoader restart
+    • Gradient clipping
+    • AdamW optimizer
+    • Learning-rate scheduler
+    • Checkpoint saving/loading
+    • Resume training
+    • NaN / Inf protection
+    • CUDA support
+    • Training statistics
 
-The trainer is responsible for the actual optimization
-process. Model architecture, dataset creation, optimizer,
-scheduler and checkpoint implementation remain in their
-respective modules.
+Important
+---------
+MyGPT2 uses an IterableDataset. Therefore a DataLoader can
+naturally reach StopIteration even though training should
+continue.
+
+For step-based training, the trainer automatically creates a
+new iterator when the current DataLoader iterator is exhausted.
+
+This allows:
+
+    --max-steps 10000
+
+to actually reach 10,000 optimization steps instead of
+stopping at the number of batches produced by one pass through
+the dataset.
 
 ============================================================
 """
@@ -43,7 +48,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -67,6 +72,7 @@ from model.model import MyGPTModel
 
 from training.optimizer import create_optimizer
 from training.scheduler import create_scheduler
+
 from training.checkpoint import (
     save_checkpoint,
     load_checkpoint,
@@ -81,19 +87,13 @@ class Trainer:
     """
     Main MyGPT2 training engine.
 
-    Responsibilities
-    ----------------
-    • Model training
-    • Forward pass
-    • Loss calculation
-    • Backward pass
-    • Gradient clipping
-    • Optimizer updates
-    • Scheduler updates
-    • Validation
-    • Checkpoint saving
-    • Checkpoint loading
-    • Training statistics
+    Supports both:
+
+        1. Epoch-based training
+        2. Step-based training
+
+    The step-based API is the preferred API for GPT-style
+    pretraining.
     """
 
     # ========================================================
@@ -122,7 +122,6 @@ class Trainer:
 
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
-
             else:
                 self.device = torch.device("cpu")
 
@@ -162,13 +161,7 @@ class Trainer:
         # Scheduler
         # ----------------------------------------------------
 
-        if scheduler is None:
-
-            self.scheduler = None
-
-        else:
-
-            self.scheduler = scheduler
+        self.scheduler = scheduler
 
         # ----------------------------------------------------
         # Training state
@@ -194,6 +187,16 @@ class Trainer:
 
         self.training_start_time: float | None = None
 
+        self.last_gradient_norm: float | None = None
+
+        # ----------------------------------------------------
+        # Step-based iterator
+        # ----------------------------------------------------
+
+        self._train_iterator: Iterator[Any] | None = None
+
+        self._train_iterator_restarts = 0
+
         # ----------------------------------------------------
         # Checkpoint directory
         # ----------------------------------------------------
@@ -210,6 +213,213 @@ class Trainer:
         )
 
     # ========================================================
+    # Internal: Get New Training Iterator
+    # ========================================================
+
+    def _create_train_iterator(self) -> Iterator[Any]:
+        """
+        Create a fresh iterator from the training DataLoader.
+        """
+
+        if self.train_loader is None:
+
+            raise RuntimeError(
+                "Training DataLoader is not available."
+            )
+
+        iterator = iter(self.train_loader)
+
+        self._train_iterator_restarts += 1
+
+        return iterator
+
+    # ========================================================
+    # Internal: Next Training Batch
+    # ========================================================
+
+    def _next_train_batch(self) -> Any:
+        """
+        Return the next training batch.
+
+        If an IterableDataset is exhausted, automatically
+        restart the DataLoader.
+
+        This is critical for long step-based training.
+        """
+
+        if self._train_iterator is None:
+
+            self._train_iterator = (
+                self._create_train_iterator()
+            )
+
+        try:
+
+            return next(
+                self._train_iterator
+            )
+
+        except StopIteration:
+
+            # ------------------------------------------------
+            # Dataset exhausted.
+            #
+            # Start another pass.
+            # ------------------------------------------------
+
+            self.current_epoch += 1
+
+            self._train_iterator = (
+                self._create_train_iterator()
+            )
+
+            try:
+
+                return next(
+                    self._train_iterator
+                )
+
+            except StopIteration as exc:
+
+                raise RuntimeError(
+                    "Training DataLoader produced "
+                    "zero batches even after restarting."
+                ) from exc
+
+    # ========================================================
+    # Internal: Validate Batch
+    # ========================================================
+
+    @staticmethod
+    def _unpack_batch(
+        batch: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Validate and unpack a DataLoader batch.
+        """
+
+        if not isinstance(
+            batch,
+            (tuple, list),
+        ):
+
+            raise RuntimeError(
+                "DataLoader batch must be "
+                "(input_ids, labels)."
+            )
+
+        if len(batch) != 2:
+
+            raise RuntimeError(
+                "Expected exactly two batch tensors: "
+                "(input_ids, labels)."
+            )
+
+        input_ids, labels = batch
+
+        if not torch.is_tensor(input_ids):
+
+            raise TypeError(
+                "input_ids must be a torch.Tensor."
+            )
+
+        if not torch.is_tensor(labels):
+
+            raise TypeError(
+                "labels must be a torch.Tensor."
+            )
+
+        if input_ids.ndim != 2:
+
+            raise ValueError(
+                "input_ids must have shape "
+                "[batch, sequence_length]. "
+                f"Received: {tuple(input_ids.shape)}"
+            )
+
+        if labels.ndim != 2:
+
+            raise ValueError(
+                "labels must have shape "
+                "[batch, sequence_length]. "
+                f"Received: {tuple(labels.shape)}"
+            )
+
+        if input_ids.shape != labels.shape:
+
+            raise ValueError(
+                "input_ids and labels must have "
+                "the same shape. "
+                f"Input: {tuple(input_ids.shape)}, "
+                f"Labels: {tuple(labels.shape)}"
+            )
+
+        return input_ids, labels
+
+    # ========================================================
+    # Internal: Extract Model Loss
+    # ========================================================
+
+    @staticmethod
+    def _extract_loss(
+        output: Any,
+    ) -> torch.Tensor:
+        """
+        Extract loss from the current MyGPT2 model API.
+
+        Supported:
+
+            (logits, loss)
+
+        or:
+
+            object.logits
+            object.loss
+        """
+
+        if isinstance(output, tuple):
+
+            if len(output) != 2:
+
+                raise RuntimeError(
+                    "Expected model output format: "
+                    "(logits, loss)."
+                )
+
+            _, loss = output
+
+        else:
+
+            if not hasattr(output, "loss"):
+
+                raise RuntimeError(
+                    "Model output does not contain "
+                    "a loss value."
+                )
+
+            loss = output.loss
+
+        if loss is None:
+
+            raise RuntimeError(
+                "Model returned None for loss."
+            )
+
+        if not torch.is_tensor(loss):
+
+            raise TypeError(
+                "Model loss must be a torch.Tensor."
+            )
+
+        if not torch.isfinite(loss):
+
+            raise RuntimeError(
+                "Loss became NaN or infinite."
+            )
+
+        return loss
+
+    # ========================================================
     # Training Step
     # ========================================================
 
@@ -220,26 +430,12 @@ class Trainer:
     ) -> float:
         """
         Execute one complete optimization step.
-
-        Steps:
-
-            1. Zero gradients
-            2. Forward pass
-            3. Calculate loss
-            4. Backward pass
-            5. Gradient clipping
-            6. Optimizer update
-            7. Scheduler update
         """
-
-        # ----------------------------------------------------
-        # Training mode
-        # ----------------------------------------------------
 
         self.model.train()
 
         # ----------------------------------------------------
-        # Move data to device
+        # Move data
         # ----------------------------------------------------
 
         input_ids = input_ids.to(
@@ -269,52 +465,9 @@ class Trainer:
             labels=labels,
         )
 
-        # ----------------------------------------------------
-        # Current MyGPT2 API:
-        #
-        #     logits, loss
-        #
-        # Also support an object with .loss.
-        # ----------------------------------------------------
-
-        if isinstance(output, tuple):
-
-            if len(output) != 2:
-
-                raise RuntimeError(
-                    "Expected model output "
-                    "format: (logits, loss)."
-                )
-
-            logits, loss = output
-
-        else:
-
-            if not hasattr(output, "loss"):
-
-                raise RuntimeError(
-                    "Model output does not contain "
-                    "a loss value."
-                )
-
-            logits = output.logits
-            loss = output.loss
-
-        # ----------------------------------------------------
-        # Validate loss
-        # ----------------------------------------------------
-
-        if loss is None:
-
-            raise RuntimeError(
-                "Model returned None for loss."
-            )
-
-        if not torch.isfinite(loss):
-
-            raise RuntimeError(
-                "Loss became NaN or infinite."
-            )
+        loss = self._extract_loss(
+            output
+        )
 
         # ----------------------------------------------------
         # Backward
@@ -333,8 +486,24 @@ class Trainer:
             )
         )
 
+        if torch.is_tensor(
+            gradient_norm
+        ):
+
+            self.last_gradient_norm = (
+                float(
+                    gradient_norm.detach().cpu()
+                )
+            )
+
+        else:
+
+            self.last_gradient_norm = (
+                float(gradient_norm)
+            )
+
         # ----------------------------------------------------
-        # Optimizer
+        # Optimizer update
         # ----------------------------------------------------
 
         self.optimizer.step()
@@ -351,8 +520,12 @@ class Trainer:
         # Statistics
         # ----------------------------------------------------
 
-        batch_tokens = (
+        batch_tokens = int(
             input_ids.numel()
+        )
+
+        batch_samples = int(
+            input_ids.shape[0]
         )
 
         self.total_tokens += (
@@ -360,16 +533,20 @@ class Trainer:
         )
 
         self.total_samples += (
-            input_ids.shape[0]
+            batch_samples
         )
 
         self.global_step += 1
 
-        self.current_train_loss = (
-            loss.item()
+        loss_value = float(
+            loss.detach().item()
         )
 
-        return loss.item()
+        self.current_train_loss = (
+            loss_value
+        )
+
+        return loss_value
 
     # ========================================================
     # Validation Step
@@ -383,8 +560,6 @@ class Trainer:
     ) -> float:
         """
         Execute one validation step.
-
-        No gradients are calculated.
         """
 
         self.model.eval()
@@ -404,53 +579,31 @@ class Trainer:
             labels=labels,
         )
 
-        if isinstance(output, tuple):
+        loss = self._extract_loss(
+            output
+        )
 
-            if len(output) != 2:
-
-                raise RuntimeError(
-                    "Expected model output "
-                    "format: (logits, loss)."
-                )
-
-            _, loss = output
-
-        else:
-
-            if not hasattr(output, "loss"):
-
-                raise RuntimeError(
-                    "Model output does not contain "
-                    "a loss value."
-                )
-
-            loss = output.loss
-
-        if loss is None:
-
-            raise RuntimeError(
-                "Validation returned None loss."
-            )
-
-        if not torch.isfinite(loss):
-
-            raise RuntimeError(
-                "Validation loss became "
-                "NaN or infinite."
-            )
-
-        return loss.item()
+        return float(
+            loss.detach().item()
+        )
 
     # ========================================================
     # Validation
     # ========================================================
 
-    @torch.no_grad()
     def validate(
         self,
+        max_batches: int | None = None,
     ) -> float | None:
         """
-        Run validation across the entire validation loader.
+        Run validation.
+
+        Parameters
+        ----------
+        max_batches:
+            Optional limit for validation batches.
+
+            Useful for large validation datasets.
         """
 
         if self.val_loader is None:
@@ -467,28 +620,9 @@ class Trainer:
 
         for batch in self.val_loader:
 
-            # ------------------------------------------------
-            # Support tuple/list batches.
-            # ------------------------------------------------
-
-            if not isinstance(
-                batch,
-                (tuple, list),
-            ):
-
-                raise RuntimeError(
-                    "DataLoader batch must be "
-                    "(input_ids, labels)."
-                )
-
-            if len(batch) != 2:
-
-                raise RuntimeError(
-                    "Expected DataLoader batch "
-                    "to contain input_ids and labels."
-                )
-
-            input_ids, labels = batch
+            input_ids, labels = (
+                self._unpack_batch(batch)
+            )
 
             loss = self.validation_step(
                 input_ids,
@@ -498,6 +632,13 @@ class Trainer:
             total_loss += loss
 
             batches += 1
+
+            if (
+                max_batches is not None
+                and batches >= max_batches
+            ):
+
+                break
 
         if batches == 0:
 
@@ -519,6 +660,7 @@ class Trainer:
         print(
             f"Validation completed | "
             f"Loss: {average_loss:.6f} | "
+            f"Batches: {batches} | "
             f"Time: {elapsed:.2f}s"
         )
 
@@ -533,7 +675,7 @@ class Trainer:
         epoch: int,
     ) -> float:
         """
-        Train the model for one complete epoch.
+        Train for one complete pass through the DataLoader.
         """
 
         self.model.train()
@@ -545,49 +687,22 @@ class Trainer:
         batches = 0
 
         print()
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
         print(
             f"Epoch {epoch + 1} "
             f"/ {self.config.max_epochs}"
         )
 
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
         for batch_index, batch in enumerate(
             self.train_loader
         ):
 
-            # ------------------------------------------------
-            # Validate batch
-            # ------------------------------------------------
-
-            if not isinstance(
-                batch,
-                (tuple, list),
-            ):
-
-                raise RuntimeError(
-                    "DataLoader batch must "
-                    "be (input_ids, labels)."
-                )
-
-            if len(batch) != 2:
-
-                raise RuntimeError(
-                    "Expected exactly two "
-                    "batch tensors."
-                )
-
-            input_ids, labels = batch
-
-            # ------------------------------------------------
-            # Training step
-            # ------------------------------------------------
+            input_ids, labels = (
+                self._unpack_batch(batch)
+            )
 
             loss = self.train_step(
                 input_ids,
@@ -598,30 +713,16 @@ class Trainer:
 
             batches += 1
 
-            # ------------------------------------------------
-            # Progress logging
-            # ------------------------------------------------
-
             if (
                 batch_index == 0
                 or (batch_index + 1) % 10 == 0
             ):
 
-                current_lr = (
-                    self.get_learning_rate()
-                )
-
-                elapsed = (
-                    time.time()
-                    - epoch_start
-                )
-
                 print(
                     f"Step {self.global_step:>7} | "
                     f"Batch {batch_index + 1:>6} | "
                     f"Loss {loss:.6f} | "
-                    f"LR {current_lr:.8f} | "
-                    f"Time {elapsed:.1f}s"
+                    f"LR {self.get_learning_rate():.8f}"
                 )
 
         if batches == 0:
@@ -662,6 +763,312 @@ class Trainer:
         return average_loss
 
     # ========================================================
+    # Step-Based Training
+    # ========================================================
+
+    def train_steps(
+        self,
+        max_steps: int,
+        *,
+        log_every: int = 1,
+        save_every: int | None = None,
+        save_filename: str = "latest.pt",
+        stop_on_dataloader_exhaustion: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Train for exactly max_steps optimization steps.
+
+        This is the preferred training method for GPT-style
+        pretraining.
+
+        Important
+        ---------
+        IterableDataset exhaustion is NOT considered a failure.
+
+        The DataLoader is automatically restarted.
+
+        Parameters
+        ----------
+        max_steps:
+            Number of optimization steps to execute.
+
+        log_every:
+            Print progress every N steps.
+
+        save_every:
+            Save checkpoint every N steps.
+
+        save_filename:
+            Checkpoint filename.
+
+        stop_on_dataloader_exhaustion:
+            If True, stop when one DataLoader pass ends.
+
+            Normally this should remain False.
+        """
+
+        if max_steps < 1:
+
+            raise ValueError(
+                "max_steps must be at least 1."
+            )
+
+        if log_every < 1:
+
+            raise ValueError(
+                "log_every must be at least 1."
+            )
+
+        if (
+            save_every is not None
+            and save_every < 1
+        ):
+
+            raise ValueError(
+                "save_every must be at least 1."
+            )
+
+        self.model.train()
+
+        if self.training_start_time is None:
+
+            self.training_start_time = (
+                time.time()
+            )
+
+        start_step = self.global_step
+
+        target_step = (
+            start_step + max_steps
+        )
+
+        running_loss = 0.0
+
+        steps_completed = 0
+
+        iterator_restarts_before = (
+            self._train_iterator_restarts
+        )
+
+        print()
+        print("=" * 75)
+
+        print(
+            "Step-Based Training"
+        )
+
+        print("=" * 75)
+
+        print(
+            f"Starting Step   : "
+            f"{self.global_step}"
+        )
+
+        print(
+            f"Target Step     : "
+            f"{target_step}"
+        )
+
+        print(
+            f"Remaining Steps : "
+            f"{max_steps}"
+        )
+
+        print(
+            f"Device          : "
+            f"{self.device}"
+        )
+
+        print("=" * 75)
+
+        while self.global_step < target_step:
+
+            try:
+
+                batch = (
+                    self._next_train_batch()
+                )
+
+            except RuntimeError:
+
+                if stop_on_dataloader_exhaustion:
+
+                    print(
+                        "WARNING: DataLoader "
+                        "ended."
+                    )
+
+                    break
+
+                raise
+
+            input_ids, labels = (
+                self._unpack_batch(batch)
+            )
+
+            loss = self.train_step(
+                input_ids,
+                labels,
+            )
+
+            running_loss += loss
+
+            steps_completed += 1
+
+            # ------------------------------------------------
+            # Logging
+            # ------------------------------------------------
+
+            should_log = (
+                self.global_step % log_every == 0
+                or self.global_step == 1
+                or self.global_step == target_step
+            )
+
+            if should_log:
+
+                elapsed = (
+                    time.time()
+                    - self.training_start_time
+                )
+
+                avg_loss = (
+                    running_loss
+                    / max(
+                        steps_completed,
+                        1,
+                    )
+                )
+
+                print(
+                    f"Step "
+                    f"{self.global_step:>7} | "
+                    f"Loss {loss:.6f} | "
+                    f"Avg {avg_loss:.6f} | "
+                    f"LR "
+                    f"{self.get_learning_rate():.8f} | "
+                    f"Time {elapsed:.1f}s"
+                )
+
+            # ------------------------------------------------
+            # Periodic checkpoint
+            # ------------------------------------------------
+
+            if (
+                save_every is not None
+                and self.global_step % save_every == 0
+            ):
+
+                checkpoint_path = self.save(
+                    save_filename
+                )
+
+                print(
+                    f"Checkpoint saved: "
+                    f"{checkpoint_path}"
+                )
+
+        average_loss = (
+            running_loss
+            / max(
+                steps_completed,
+                1,
+            )
+        )
+
+        self.current_train_loss = (
+            average_loss
+        )
+
+        restarts_used = (
+            self._train_iterator_restarts
+            - iterator_restarts_before
+        )
+
+        elapsed = (
+            time.time()
+            - self.training_start_time
+        )
+
+        completed = (
+            self.global_step >= target_step
+        )
+
+        print()
+        print("=" * 75)
+
+        print(
+            "Step-Based Training Completed"
+        )
+
+        print("=" * 75)
+
+        print(
+            f"Steps Completed : "
+            f"{steps_completed}"
+        )
+
+        print(
+            f"Global Step     : "
+            f"{self.global_step}"
+        )
+
+        print(
+            f"Average Loss    : "
+            f"{average_loss:.6f}"
+        )
+
+        print(
+            f"Final Loss      : "
+            f"{self.current_train_loss:.6f}"
+        )
+
+        print(
+            f"LR              : "
+            f"{self.get_learning_rate():.8f}"
+        )
+
+        print(
+            f"Tokens Seen     : "
+            f"{self.total_tokens:,}"
+        )
+
+        print(
+            f"Samples Seen    : "
+            f"{self.total_samples:,}"
+        )
+
+        print(
+            f"DataLoader Restarts : "
+            f"{restarts_used}"
+        )
+
+        print(
+            f"Elapsed Time    : "
+            f"{elapsed:.2f}s"
+        )
+
+        print(
+            f"Status          : "
+            f"{'PASSED' if completed else 'INCOMPLETE'}"
+        )
+
+        print("=" * 75)
+
+        return {
+            "steps": steps_completed,
+            "global_step": self.global_step,
+            "average_loss": average_loss,
+            "final_loss": self.current_train_loss,
+            "learning_rate": self.get_learning_rate(),
+            "tokens_seen": self.total_tokens,
+            "samples_seen": self.total_samples,
+            "dataloader_restarts": restarts_used,
+            "elapsed_seconds": elapsed,
+            "completed": completed,
+        }
+
+    # ========================================================
     # Learning Rate
     # ========================================================
 
@@ -669,7 +1076,7 @@ class Trainer:
         self,
     ) -> float:
         """
-        Return the current learning rate.
+        Return current learning rate.
         """
 
         if len(
@@ -680,8 +1087,7 @@ class Trainer:
 
         return float(
             self.optimizer
-            .param_groups[0]
-            ["lr"]
+            .param_groups[0]["lr"]
         )
 
     # ========================================================
@@ -693,7 +1099,7 @@ class Trainer:
         filename: str = "latest.pt",
     ) -> Path:
         """
-        Save current training state.
+        Save current model/training state.
         """
 
         path = (
@@ -701,45 +1107,50 @@ class Trainer:
             / filename
         )
 
-        saved_path = save_checkpoint(
+        best_loss = (
+            self.best_val_loss
+            if math.isfinite(
+                self.best_val_loss
+            )
+            else None
+        )
+
+        train_loss = (
+            self.current_train_loss
+            if math.isfinite(
+                self.current_train_loss
+            )
+            else None
+        )
+
+        val_loss = (
+            self.current_val_loss
+            if math.isfinite(
+                self.current_val_loss
+            )
+            else None
+        )
+
+        return save_checkpoint(
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             epoch=self.current_epoch,
             global_step=self.global_step,
-            best_loss=(
-                self.best_val_loss
-                if math.isfinite(
-                    self.best_val_loss
-                )
-                else None
-            ),
-            train_loss=(
-                self.current_train_loss
-                if math.isfinite(
-                    self.current_train_loss
-                )
-                else None
-            ),
-            val_loss=(
-                self.current_val_loss
-                if math.isfinite(
-                    self.current_val_loss
-                )
-                else None
-            ),
+            best_loss=best_loss,
+            train_loss=train_loss,
+            val_loss=val_loss,
             config=self.config,
             extra={
-                "total_tokens":
-                    self.total_tokens,
-
-                "total_samples":
-                    self.total_samples,
+                "total_tokens": self.total_tokens,
+                "total_samples": self.total_samples,
+                "last_gradient_norm":
+                    self.last_gradient_norm,
+                "dataloader_iterator_restarts":
+                    self._train_iterator_restarts,
             },
             path=path,
         )
-
-        return saved_path
 
     # ========================================================
     # Load Checkpoint
@@ -751,7 +1162,7 @@ class Trainer:
         restore_rng: bool = True,
     ) -> dict[str, Any]:
         """
-        Resume training from a checkpoint.
+        Load and restore a training checkpoint.
         """
 
         checkpoint = load_checkpoint(
@@ -793,8 +1204,8 @@ class Trainer:
 
         if train_loss is not None:
 
-            self.current_train_loss = (
-                float(train_loss)
+            self.current_train_loss = float(
+                train_loss
             )
 
         val_loss = checkpoint.get(
@@ -803,8 +1214,8 @@ class Trainer:
 
         if val_loss is not None:
 
-            self.current_val_loss = (
-                float(val_loss)
+            self.current_val_loss = float(
+                val_loss
             )
 
         extra = checkpoint.get(
@@ -828,10 +1239,73 @@ class Trainer:
                 )
             )
 
+            gradient_norm = extra.get(
+                "last_gradient_norm"
+            )
+
+            if gradient_norm is not None:
+
+                self.last_gradient_norm = float(
+                    gradient_norm
+                )
+
+            self._train_iterator_restarts = int(
+                extra.get(
+                    "dataloader_iterator_restarts",
+                    self._train_iterator_restarts,
+                )
+            )
+
+        # ----------------------------------------------------
+        # Never reuse an old DataLoader iterator after loading.
+        # ----------------------------------------------------
+
+        self._train_iterator = None
+
+        print()
+        print("=" * 75)
+
+        print(
+            "Checkpoint Loaded"
+        )
+
+        print("=" * 75)
+
+        print(
+            f"Checkpoint      : {path}"
+        )
+
+        print(
+            f"Epoch           : "
+            f"{self.current_epoch}"
+        )
+
+        print(
+            f"Global Step     : "
+            f"{self.global_step}"
+        )
+
+        print(
+            f"Train Loss      : "
+            f"{self.current_train_loss}"
+        )
+
+        print(
+            f"Learning Rate   : "
+            f"{self.get_learning_rate():.8f}"
+        )
+
+        print(
+            f"Tokens Seen     : "
+            f"{self.total_tokens:,}"
+        )
+
+        print("=" * 75)
+
         return checkpoint
 
     # ========================================================
-    # Full Training
+    # Full Epoch Training
     # ========================================================
 
     def train(
@@ -841,7 +1315,10 @@ class Trainer:
         validate_every_epoch: bool = True,
     ) -> None:
         """
-        Run the complete training process.
+        Run traditional epoch-based training.
+
+        For GPT pretraining with a large IterableDataset,
+        train_steps() is preferred.
         """
 
         self.training_start_time = (
@@ -849,17 +1326,13 @@ class Trainer:
         )
 
         print()
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
         print(
             "MyGPT2 Training Started"
         )
 
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
         print(
             f"Device          : "
@@ -883,30 +1356,16 @@ class Trainer:
 
         print()
 
-        # ----------------------------------------------------
-        # Epoch loop
-        # ----------------------------------------------------
-
         for epoch in range(
             self.current_epoch,
             self.config.max_epochs,
         ):
 
-            self.current_epoch = (
-                epoch
-            )
-
-            # ------------------------------------------------
-            # Train
-            # ------------------------------------------------
+            self.current_epoch = epoch
 
             train_loss = self.train_epoch(
                 epoch
             )
-
-            # ------------------------------------------------
-            # Validation
-            # ------------------------------------------------
 
             val_loss = None
 
@@ -920,13 +1379,10 @@ class Trainer:
 
             if (
                 val_loss is not None
-                and val_loss
-                < self.best_val_loss
+                and val_loss < self.best_val_loss
             ):
 
-                self.best_val_loss = (
-                    val_loss
-                )
+                self.best_val_loss = val_loss
 
                 best_path = self.save(
                     "best.pt"
@@ -957,9 +1413,7 @@ class Trainer:
             # ------------------------------------------------
 
             print()
-            print(
-                "-" * 75
-            )
+            print("-" * 75)
 
             print(
                 f"Epoch {epoch + 1} Summary"
@@ -998,13 +1452,7 @@ class Trainer:
                 f"{self.total_tokens:,}"
             )
 
-            print(
-                "-" * 75
-            )
-
-        # ----------------------------------------------------
-        # Finished
-        # ----------------------------------------------------
+            print("-" * 75)
 
         total_time = (
             time.time()
@@ -1012,17 +1460,13 @@ class Trainer:
         )
 
         print()
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
         print(
             "MyGPT2 Training Completed"
         )
 
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
         print(
             f"Final Epoch     : "
@@ -1058,9 +1502,7 @@ class Trainer:
             f"{total_time / 3600:.2f} hours"
         )
 
-        print(
-            "=" * 75
-        )
+        print("=" * 75)
 
 
 # ============================================================
@@ -1111,8 +1553,8 @@ if __name__ == "__main__":
 
     config = GPTConfig()
 
-    # Use a tiny test batch rather than loading the complete
-    # dataset just to verify Trainer functionality.
+    # --------------------------------------------------------
+    # Model
     # --------------------------------------------------------
 
     print(
@@ -1130,7 +1572,7 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Test DataLoader
+    # Test batches
     # --------------------------------------------------------
 
     test_batches = []
@@ -1192,7 +1634,6 @@ if __name__ == "__main__":
         model=model,
         train_loader=test_batches,
         config=config,
-        val_loader=None,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
@@ -1237,36 +1678,40 @@ if __name__ == "__main__":
     )
 
     print(
-        "Trainer step     : ✅ PASSED"
+        "Trainer step     : PASSED"
     )
 
     print()
 
     # --------------------------------------------------------
-    # Epoch test
+    # Step-based restart test
     # --------------------------------------------------------
 
     print(
-        "Running one epoch test..."
+        "Testing DataLoader restart..."
     )
 
-    epoch_loss = trainer.train_epoch(
-        epoch=0
+    result = trainer.train_steps(
+        max_steps=5,
+        log_every=1,
     )
 
-    print(
-        f"Epoch Loss      : "
-        f"{epoch_loss:.6f}"
-    )
+    if result["completed"]:
 
-    print(
-        "Epoch training   : ✅ PASSED"
-    )
+        print(
+            "Step training    : PASSED"
+        )
+
+    else:
+
+        raise RuntimeError(
+            "Step training did not reach target."
+        )
 
     print()
 
     # --------------------------------------------------------
-    # Checkpoint test
+    # Checkpoint
     # --------------------------------------------------------
 
     print(
@@ -1282,8 +1727,14 @@ if __name__ == "__main__":
         f"{checkpoint_path}"
     )
 
+    if not checkpoint_path.exists():
+
+        raise RuntimeError(
+            "Checkpoint file was not created."
+        )
+
     print(
-        "Checkpoint save  : ✅ PASSED"
+        "Checkpoint save  : PASSED"
     )
 
     print()
@@ -1293,7 +1744,9 @@ if __name__ == "__main__":
     # --------------------------------------------------------
 
     print("=" * 75)
+
     print(
         "Trainer test completed successfully."
     )
+
     print("=" * 75)

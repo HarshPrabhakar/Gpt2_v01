@@ -2033,11 +2033,12 @@ def main() -> None:
 
         dataset_pass = 1
 
+        start_time = time.time()
+
         print()
         print(
             f"Starting dataset pass {dataset_pass}..."
         )
-
         while trainer.global_step < target_steps:
 
             # ----------------------------------------------------
@@ -2215,12 +2216,12 @@ def main() -> None:
         # --------------------------------------------------------
         # Summary
         # --------------------------------------------------------
-
+        start_time = time.time()
         elapsed = (
             time.time()
             - start_time
         )
-
+        
         print()
         print("=" * 75)
         print("Step-Limited Training Completed")
@@ -2250,7 +2251,7 @@ def main() -> None:
             f"Elapsed Time    : "
             f"{elapsed:.2f}s"
         )
-
+        
         if trainer.global_step >= target_steps:
 
             print(

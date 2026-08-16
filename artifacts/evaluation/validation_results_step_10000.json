@@ -1,0 +1,36 @@
+{
+    "checkpoint": {
+        "path": "D:\\Gpt2_v01\\artifacts\\checkpoints\\final_step_00010000.pt",
+        "version": "1.2",
+        "global_step": 10000
+    },
+    "model": {
+        "parameters": 110025216,
+        "vocab_size": 32000,
+        "sequence_length": 512,
+        "hidden_size": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "intermediate_size": 3072
+    },
+    "evaluation": {
+        "dataset": "roneneldan/TinyStories",
+        "documents": 569,
+        "sequences": 9,
+        "tokens": 4608,
+        "batches": 2
+    },
+    "metrics": {
+        "training_loss": 1.3898952007293701,
+        "validation_loss": 1.3277729617224798,
+        "training_perplexity": 4.014429321683512,
+        "validation_perplexity": 3.7726322286785052,
+        "top_1_accuracy": 0.66796875,
+        "top_5_accuracy": 0.8958333333333334,
+        "top_10_accuracy": 0.9388020833333334
+    },
+    "runtime": {
+        "device": "cuda",
+        "validation_time_seconds": 0.6175084114074707
+    }
+}

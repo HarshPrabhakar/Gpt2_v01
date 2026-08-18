@@ -1,0 +1,40 @@
+{
+    "checkpoint": {
+        "path": "D:\\Gpt2_v01\\artifacts\\checkpoints\\final_step_00010000.pt",
+        "version": "1.2",
+        "epoch": 0,
+        "global_step": 10000
+    },
+    "model": {
+        "parameters": 110025216,
+        "trainable_parameters": 110025216,
+        "vocab_size": 32000,
+        "sequence_length": 512,
+        "hidden_size": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "intermediate_size": 3072
+    },
+    "dataset": {
+        "name": "roneneldan/TinyStories",
+        "split": "validation",
+        "documents_total": 21990,
+        "documents_processed": 2501,
+        "documents_skipped": 0,
+        "sequences": 976,
+        "tokens_evaluated": 499712
+    },
+    "metrics": {
+        "training_loss": 1.3898952007293701,
+        "validation_loss": 3.4182219153544944,
+        "training_perplexity": 4.014429321683512,
+        "validation_perplexity": 30.515108308852685,
+        "top1_accuracy": 0.40857734054815575,
+        "top5_accuracy": 0.6624695824795082,
+        "top10_accuracy": 0.7372686667520492
+    },
+    "evaluation": {
+        "device": "cuda",
+        "evaluation_time_seconds": 18.301291704177856
+    }
+}

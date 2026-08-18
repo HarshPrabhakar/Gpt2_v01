@@ -35,6 +35,6 @@
     },
     "evaluation": {
         "device": "cuda",
-        "evaluation_time_seconds": 18.301291704177856
+        "evaluation_time_seconds": 18.27775812149048
     }
 }

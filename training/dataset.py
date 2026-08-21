@@ -13,7 +13,7 @@ Pipeline:
     Raw Dataset
         |
         v
-    Text Documents
+    Training Documents ONLY
         |
         v
     MyGPTTokenizer
@@ -28,10 +28,27 @@ Pipeline:
     Input IDs + Target IDs
         |
         v
-    PyTorch Dataset
+    PyTorch IterableDataset
         |
         v
     DataLoader
+        |
+        v
+    GPU
+        |
+        v
+    MyGPT2
+
+IMPORTANT
+---------
+This dataset is intended ONLY for model training.
+
+Evaluation splits such as:
+
+    - validation
+    - test
+
+are NEVER used for training.
 
 For autoregressive language modeling:
 
@@ -48,13 +65,20 @@ The model learns to predict the next token.
 
 from __future__ import annotations
 
+
 # ============================================================
 # Standard Library
 # ============================================================
 
 import sys
+
 from pathlib import Path
-from typing import Iterator, Optional, Sequence
+
+from typing import (
+    Iterator,
+    Optional,
+    Sequence,
+)
 
 
 # ============================================================
@@ -72,6 +96,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # ============================================================
 
 import torch
+
 from torch.utils.data import IterableDataset
 
 
@@ -99,6 +124,7 @@ TOKENIZER_PATH = (
 # ============================================================
 
 DEFAULT_DATASETS = {
+
     "TinyStories": (
         PROJECT_ROOT
         / "datasets"
@@ -126,6 +152,34 @@ DEFAULT_DATASETS = {
         / "FineWeb"
         / "raw"
     ),
+}
+
+
+# ============================================================
+# Training Split Configuration
+# ============================================================
+
+# These splits are NEVER used for training.
+#
+# This is deliberately explicit so that a DatasetDict such as:
+#
+#     train
+#     validation
+#     test
+#
+# will only use:
+#
+#     train
+#
+# This prevents accidental data leakage.
+
+EXCLUDED_SPLITS = {
+    "test",
+    "validation",
+    "valid",
+    "dev",
+    "eval",
+    "evaluation",
 }
 
 
@@ -173,6 +227,11 @@ class GPTTextDataset(IterableDataset):
 
         If None, sequence_length is used.
 
+    Notes
+    -----
+    This dataset intentionally uses only training data.
+
+    Evaluation splits such as validation/test are skipped.
     """
 
     def __init__(
@@ -211,6 +270,24 @@ class GPTTextDataset(IterableDataset):
             raise RuntimeError(
                 "The tokenizer is not loaded."
             )
+
+        if max_documents is not None:
+
+            if max_documents < 1:
+
+                raise ValueError(
+                    "max_documents must be positive "
+                    "when specified."
+                )
+
+        if stride is not None:
+
+            if stride < 1:
+
+                raise ValueError(
+                    "stride must be positive "
+                    "when specified."
+                )
 
         # ----------------------------------------------------
         # Dataset paths
@@ -261,11 +338,20 @@ class GPTTextDataset(IterableDataset):
 
         self.tokens_generated = 0
 
+        # ----------------------------------------------------
+        # Dataset statistics
+        # ----------------------------------------------------
+
+        self.dataset_statistics = {}
+
     # ========================================================
     # Reset Statistics
     # ========================================================
 
     def reset_statistics(self) -> None:
+        """
+        Reset runtime statistics before a new iteration.
+        """
 
         self.documents_seen = 0
 
@@ -276,6 +362,8 @@ class GPTTextDataset(IterableDataset):
         self.samples_generated = 0
 
         self.tokens_generated = 0
+
+        self.dataset_statistics = {}
 
     # ========================================================
     # Load Dataset
@@ -295,13 +383,181 @@ class GPTTextDataset(IterableDataset):
         if not dataset_path.exists():
 
             raise FileNotFoundError(
-                f"Dataset path does not exist:\n"
+                "Dataset path does not exist:\n"
                 f"{dataset_path}"
             )
 
         return load_from_disk(
             str(dataset_path)
         )
+
+    # ========================================================
+    # Determine Training Splits
+    # ========================================================
+
+    def _get_training_splits(
+        self,
+        dataset,
+        dataset_name: str,
+    ):
+        """
+        Determine which splits should be used for training.
+
+        Supported cases:
+
+        1. DatasetDict
+
+            {
+                "train": ...,
+                "validation": ...,
+                "test": ...
+            }
+
+            Result:
+
+                train only
+
+        2. Dataset
+
+            A dataset without named splits.
+
+            Result:
+
+                dataset itself
+
+        IMPORTANT
+        ---------
+        Validation/test/evaluation splits are never used.
+        """
+
+        # ----------------------------------------------------
+        # DatasetDict
+        # ----------------------------------------------------
+
+        if hasattr(dataset, "items"):
+
+            available_splits = [
+                str(name)
+                for name, _ in dataset.items()
+            ]
+
+            print(
+                "  Available Splits : "
+                f"{', '.join(available_splits)}"
+            )
+
+            training_splits = []
+
+            # ------------------------------------------------
+            # Prefer explicit train split
+            # ------------------------------------------------
+
+            for split_name, split in dataset.items():
+
+                normalized_name = (
+                    str(split_name)
+                    .strip()
+                    .lower()
+                )
+
+                # --------------------------------------------
+                # Never use evaluation splits
+                # --------------------------------------------
+
+                if normalized_name in EXCLUDED_SPLITS:
+
+                    print(
+                        f"  Skipping Split     : "
+                        f"{split_name} "
+                        f"(evaluation split)"
+                    )
+
+                    continue
+
+                # --------------------------------------------
+                # Only use train-like split
+                # --------------------------------------------
+
+                if normalized_name == "train":
+
+                    training_splits.append(
+                        (
+                            str(split_name),
+                            split,
+                        )
+                    )
+
+            # ------------------------------------------------
+            # If explicit train split exists
+            # ------------------------------------------------
+
+            if training_splits:
+
+                return training_splits
+
+            # ------------------------------------------------
+            # Fallback
+            # ------------------------------------------------
+            #
+            # Some datasets may have an unusual name.
+            #
+            # We DO NOT automatically consume arbitrary
+            # evaluation-looking data.
+            #
+            # If there is no train split, look for a split
+            # that is not explicitly evaluation data.
+            # ------------------------------------------------
+
+            for split_name, split in dataset.items():
+
+                normalized_name = (
+                    str(split_name)
+                    .strip()
+                    .lower()
+                )
+
+                if normalized_name in EXCLUDED_SPLITS:
+
+                    continue
+
+                print(
+                    f"  Using Split        : "
+                    f"{split_name}"
+                )
+
+                return [
+                    (
+                        str(split_name),
+                        split,
+                    )
+                ]
+
+            # ------------------------------------------------
+            # No valid training split
+            # ------------------------------------------------
+
+            print(
+                f"  WARNING            : "
+                f"No training split found for "
+                f"{dataset_name}"
+            )
+
+            return []
+
+        # ----------------------------------------------------
+        # Normal Dataset
+        # ----------------------------------------------------
+
+        print(
+            "  Split              : dataset"
+        )
+
+        return [
+            (
+                "dataset",
+                dataset,
+            )
+        ]
 
     # ========================================================
     # Extract Text
@@ -313,11 +569,23 @@ class GPTTextDataset(IterableDataset):
     ) -> str:
         """
         Extract the `text` field from a dataset record.
+
+        Returns
+        -------
+        str
+            Clean text or empty string.
         """
+
+        if not isinstance(
+            record,
+            dict,
+        ):
+
+            return ""
 
         text = record.get(
             "text",
-            ""
+            "",
         )
 
         if text is None:
@@ -397,7 +665,6 @@ class GPTTextDataset(IterableDataset):
             Target:
 
                 [20, 30, 40, 50]
-
         """
 
         required_tokens = (
@@ -491,9 +758,18 @@ class GPTTextDataset(IterableDataset):
         ]
     ]:
         """
-        Iterate over all datasets and generate
-        GPT training samples.
+        Iterate over all training datasets.
+
+        IMPORTANT
+        ---------
+        Only training splits are consumed.
+
+        Evaluation splits are skipped.
         """
+
+        # ----------------------------------------------------
+        # Reset statistics
+        # ----------------------------------------------------
 
         self.reset_statistics()
 
@@ -505,45 +781,75 @@ class GPTTextDataset(IterableDataset):
             self._dataset_items()
         ):
 
+            print()
+
             print(
-                f"\nLoading Dataset: "
+                f"Loading Dataset: "
                 f"{dataset_name}"
             )
 
-            dataset = (
-                self._load_dataset(
-                    dataset_path
+            print(
+                f"  Path               : "
+                f"{dataset_path}"
+            )
+
+            # ------------------------------------------------
+            # Load dataset
+            # ------------------------------------------------
+
+            try:
+
+                dataset = (
+                    self._load_dataset(
+                        dataset_path
+                    )
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"  ERROR loading dataset: "
+                    f"{exc}"
+                )
+
+                raise
+
+            # ------------------------------------------------
+            # Determine training splits
+            # ------------------------------------------------
+
+            training_splits = (
+                self._get_training_splits(
+                    dataset,
+                    dataset_name,
                 )
             )
 
             # ------------------------------------------------
-            # DatasetDict
+            # No usable training split
             # ------------------------------------------------
 
-            if hasattr(
-                dataset,
-                "items",
-            ):
+            if not training_splits:
 
-                splits = dataset.items()
+                print(
+                    f"  WARNING: No usable "
+                    f"training split."
+                )
 
-            else:
-
-                splits = [
-                    (
-                        "dataset",
-                        dataset,
-                    )
-                ]
+                continue
 
             # ------------------------------------------------
             # Split loop
             # ------------------------------------------------
 
-            for split_name, split in splits:
+            for (
+                split_name,
+                split,
+            ) in training_splits:
 
                 print(
-                    f"  Split: {split_name}"
+                    f"  Training Split      : "
+                    f"{split_name}"
                 )
 
                 # --------------------------------------------
@@ -563,7 +869,18 @@ class GPTTextDataset(IterableDataset):
                         >= self.max_documents
                     ):
 
+                        print()
+
+                        print(
+                            "Maximum document limit "
+                            "reached."
+                        )
+
                         return
+
+                    # ----------------------------------------
+                    # Document counter
+                    # ----------------------------------------
 
                     self.documents_seen += 1
 
@@ -576,6 +893,10 @@ class GPTTextDataset(IterableDataset):
                             record
                         )
                     )
+
+                    # ----------------------------------------
+                    # Empty document
+                    # ----------------------------------------
 
                     if not text:
 
@@ -599,9 +920,21 @@ class GPTTextDataset(IterableDataset):
 
                         self.documents_skipped += 1
 
+                        print()
+
                         print(
-                            "\nWarning: tokenizer "
+                            "WARNING: tokenizer "
                             "failed."
+                        )
+
+                        print(
+                            f"Dataset : "
+                            f"{dataset_name}"
+                        )
+
+                        print(
+                            f"Split   : "
+                            f"{split_name}"
                         )
 
                         print(
@@ -610,13 +943,14 @@ class GPTTextDataset(IterableDataset):
                         )
 
                         print(
-                            f"Error: {exc}"
+                            f"Error   : "
+                            f"{exc}"
                         )
 
                         continue
 
                     # ----------------------------------------
-                    # Empty tokens
+                    # Empty token sequence
                     # ----------------------------------------
 
                     if not token_ids:
@@ -647,17 +981,32 @@ class GPTTextDataset(IterableDataset):
 
     def _dataset_items(self):
 
-        for name, path in DEFAULT_DATASETS.items():
+        for (
+            name,
+            path,
+        ) in DEFAULT_DATASETS.items():
 
             if path.exists():
 
-                yield name, path
+                yield (
+                    name,
+                    path,
+                )
 
             else:
 
+                print()
+
                 print(
-                    f"\nWarning: dataset not found:"
-                    f"\n{path}"
+                    "WARNING: dataset not found:"
+                )
+
+                print(
+                    f"  {name}:"
+                )
+
+                print(
+                    f"  {path}"
                 )
 
     # ========================================================
@@ -665,20 +1014,28 @@ class GPTTextDataset(IterableDataset):
     # ========================================================
 
     def get_statistics(self) -> dict:
+        """
+        Return current runtime dataset statistics.
+        """
 
         return {
+
             "documents_seen": (
                 self.documents_seen
             ),
+
             "documents_processed": (
                 self.documents_processed
             ),
+
             "documents_skipped": (
                 self.documents_skipped
             ),
+
             "samples_generated": (
                 self.samples_generated
             ),
+
             "tokens_generated": (
                 self.tokens_generated
             ),
@@ -700,12 +1057,17 @@ def create_training_dataset(
     """
 
     return GPTTextDataset(
+
         dataset_paths=list(
             DEFAULT_DATASETS.values()
         ),
+
         tokenizer=tokenizer,
+
         sequence_length=sequence_length,
+
         max_documents=max_documents,
+
         stride=stride,
     )
 
@@ -752,7 +1114,7 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Tokenizer loaded successfully."
+        "Tokenizer loaded successfully."
     )
 
     print(
@@ -763,25 +1125,51 @@ if __name__ == "__main__":
     print()
 
     # --------------------------------------------------------
-    # Create test dataset
+    # Test configuration
     # --------------------------------------------------------
 
-    dataset = create_training_dataset(
-        tokenizer=tokenizer,
-        sequence_length=32,
-        max_documents=20,
-    )
+    sequence_length = 32
+
+    batch_size = 4
+
+    max_documents = 20
 
     print(
         "Dataset configuration:"
     )
 
     print(
-        "  Sequence Length : 32"
+        f"  Sequence Length : "
+        f"{sequence_length}"
     )
 
     print(
-        "  Max Documents   : 20"
+        f"  Batch Size      : "
+        f"{batch_size}"
+    )
+
+    print(
+        f"  Max Documents   : "
+        f"{max_documents}"
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # Create dataset
+    # --------------------------------------------------------
+
+    dataset = create_training_dataset(
+
+        tokenizer=tokenizer,
+
+        sequence_length=sequence_length,
+
+        max_documents=max_documents,
+    )
+
+    print(
+        "Dataset created successfully."
     )
 
     print()
@@ -792,7 +1180,10 @@ if __name__ == "__main__":
 
     sample_count = 0
 
-    for input_ids, target_ids in dataset:
+    for (
+        input_ids,
+        target_ids,
+    ) in dataset:
 
         sample_count += 1
 
@@ -844,10 +1235,14 @@ if __name__ == "__main__":
 
     stats = dataset.get_statistics()
 
-    for key, value in stats.items():
+    for (
+        key,
+        value,
+    ) in stats.items():
 
         print(
-            f"{key:25}: {value:,}"
+            f"{key:25}: "
+            f"{value:,}"
         )
 
     print()

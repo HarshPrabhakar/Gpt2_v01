@@ -1,96 +1,100 @@
 """
-============================================================
-MyGPT2 - Main Training Entry Point
-============================================================
-
-Project
--------
-MyGPT2
+======================================================================
+MyGPT2 - FINAL Training Entry Point
+======================================================================
 
 Purpose
 -------
-Main entry point for training the MyGPT2 GPT model.
+Final, reproducible GPT-2 training pipeline.
 
-Pipeline
---------
-Configuration
-      ↓
-Tokenizer
-      ↓
-Dataset
-      ↓
-DataLoader
-      ↓
-GPT Model
-      ↓
-AdamW Optimizer
-      ↓
-Learning Rate Scheduler
-      ↓
-Trainer
-      ↓
-Checkpoint Manager
+This version explicitly locks:
+
+    TinyStories
+    WikiText103
+    OpenWebText
+    FineWeb
+
+The dataset mixture, order, tokenizer, model configuration and
+training configuration are written into every checkpoint.
+
+Resume is SAFE by default:
+
+    - New checkpoints must contain the training manifest.
+    - Dataset mixture must match exactly.
+    - Dataset paths must match.
+    - Dataset signatures must match.
+    - Tokenizer must match.
+    - Model configuration must match.
+    - Batch size / sequence length must match.
+
+Legacy checkpoints created by the old train.py are rejected unless:
+
+    --allow-legacy-resume
+
+is explicitly supplied.
 
 Examples
 --------
-Full training:
 
-    python train.py
+Fresh final training:
 
-Short pipeline test:
+    python train.py --max-steps 50000
 
-    python train.py --max-steps 10 --max-documents 10000
+Resume:
 
-Longer training test:
+    python train.py \
+        --resume artifacts/checkpoints/step_00020000.pt \
+        --max-steps 50000
 
-    python train.py --max-steps 100 --max-documents 10000
+Legacy checkpoint:
 
-Override batch size:
+    python train.py \
+        --resume artifacts/checkpoints/step_00020000.pt \
+        --max-steps 50000 \
+        --allow-legacy-resume
 
-    python train.py --batch-size 4
+CPU:
 
-CPU training:
+    python train.py --device cpu --max-steps 100
 
-    python train.py --device cpu
+Test:
 
-Resume training:
+    python train.py --max-steps 10 --max-documents 1000
 
-    python train.py --resume artifacts/checkpoints/latest.pt
-
-Disable checkpoint saving:
-
-    python train.py --no-save
-
-Disable validation:
-
-    python train.py --no-validation
-============================================================
+======================================================================
 """
 
 from __future__ import annotations
 
-# ============================================================
+# ======================================================================
 # Standard Library
-# ============================================================
+# ======================================================================
 
 import argparse
+import hashlib
+import json
+import os
 import random
 import sys
+import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 
-# ============================================================
+# ======================================================================
 # Third Party
-# ============================================================
+# ======================================================================
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 
-# ============================================================
+# ======================================================================
 # Project Root
-# ============================================================
+# ======================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -98,9 +102,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# ============================================================
+# ======================================================================
 # Project Imports
-# ============================================================
+# ======================================================================
 
 from model.config import GPTConfig
 from model.model import MyGPTModel
@@ -112,9 +116,11 @@ from training.optimizer import create_optimizer
 from training.scheduler import create_scheduler
 
 
-# ============================================================
+# ======================================================================
 # Constants
-# ============================================================
+# ======================================================================
+
+TRAINING_VERSION = "2.0-final-locked-mixture"
 
 DEFAULT_TOKENIZER_PATH = (
     PROJECT_ROOT
@@ -129,32 +135,79 @@ DEFAULT_CHECKPOINT_DIR = (
     / "checkpoints"
 )
 
-DEFAULT_TEST_CHECKPOINT = (
-    DEFAULT_CHECKPOINT_DIR
-    / "pipeline_test.pt"
-)
-
 DEFAULT_NUM_WORKERS = 0
 
 DEFAULT_WARMUP_RATIO = 0.10
 
+CHECKPOINT_INTERVAL = 1000
 
-# ============================================================
+
+# ======================================================================
+# LOCKED DATASET MIXTURE
+# ======================================================================
+#
+# IMPORTANT:
+#
+# Do NOT casually change this after final training starts.
+#
+# The exact order is:
+#
+#     1. TinyStories
+#     2. WikiText103
+#     3. OpenWebText
+#     4. FineWeb
+#
+# training/dataset.py previously relied on DEFAULT_DATASETS.
+# We explicitly replace that configuration before creating the
+# dataset so that this train.py owns the dataset mixture.
+# ======================================================================
+
+LOCKED_DATASETS = OrderedDict(
+    [
+        (
+            "TinyStories",
+            PROJECT_ROOT
+            / "datasets"
+            / "TinyStories"
+            / "raw",
+        ),
+        (
+            "WikiText103",
+            PROJECT_ROOT
+            / "datasets"
+            / "WikiText103"
+            / "raw",
+        ),
+        (
+            "OpenWebText",
+            PROJECT_ROOT
+            / "datasets"
+            / "OpenWebText"
+            / "raw",
+        ),
+        (
+            "FineWeb",
+            PROJECT_ROOT
+            / "datasets"
+            / "FineWeb"
+            / "raw",
+        ),
+    ]
+)
+
+
+# ======================================================================
 # Argument Parser
-# ============================================================
+# ======================================================================
 
 def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command-line arguments.
-    """
 
     parser = argparse.ArgumentParser(
-        description="Train MyGPT2."
+        description=(
+            "Final MyGPT2 training pipeline "
+            "with locked dataset mixture."
+        )
     )
-
-    # --------------------------------------------------------
-    # Training steps
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--max-steps",
@@ -162,67 +215,43 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help=(
             "Maximum optimizer steps. "
-            "Useful for testing."
+            "Required for step-limited final training."
         ),
     )
-
-    # --------------------------------------------------------
-    # Epochs
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--epochs",
         type=int,
         default=None,
-        help=(
-            "Override the number of training epochs."
-        ),
+        help="Number of epochs for non-step-limited training.",
     )
-
-    # --------------------------------------------------------
-    # Batch size
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--batch-size",
         type=int,
         default=None,
-        help=(
-            "Override training batch size."
-        ),
+        help="Override batch size.",
     )
-
-    # --------------------------------------------------------
-    # Maximum documents
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--max-documents",
         type=int,
         default=None,
         help=(
-            "Maximum number of documents to process. "
-            "Useful for testing. Default: all documents."
+            "Maximum documents across the locked dataset mixture. "
+            "Useful only for testing."
         ),
     )
-
-    # --------------------------------------------------------
-    # DataLoader workers
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--num-workers",
         type=int,
         default=DEFAULT_NUM_WORKERS,
         help=(
-            "Number of DataLoader workers. "
-            "Use 0 on Windows for reliability."
+            "DataLoader workers. "
+            "Use 0 on Windows."
         ),
     )
-
-    # --------------------------------------------------------
-    # Device
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--device",
@@ -236,54 +265,36 @@ def parse_arguments() -> argparse.Namespace:
         help="Training device.",
     )
 
-    # --------------------------------------------------------
-    # Resume
-    # --------------------------------------------------------
-
     parser.add_argument(
         "--resume",
         type=str,
         default=None,
-        help=(
-            "Path to a checkpoint to resume from."
-        ),
+        help="Checkpoint to resume from.",
     )
 
-    # --------------------------------------------------------
-    # Checkpoint
-    # --------------------------------------------------------
+    parser.add_argument(
+        "--allow-legacy-resume",
+        action="store_true",
+        help=(
+            "Allow loading an old checkpoint without the "
+            "new locked-mixture manifest."
+        ),
+    )
 
     parser.add_argument(
         "--no-save",
         action="store_true",
-        help=(
-            "Disable checkpoint saving."
-        ),
-    )
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--no-validation",
-        action="store_true",
-        help=(
-            "Disable validation."
-        ),
+        help="Disable checkpoint saving.",
     )
 
     return parser.parse_args()
 
 
-# ============================================================
+# ======================================================================
 # Reproducibility
-# ============================================================
+# ======================================================================
 
 def set_seed(seed: int) -> None:
-    """
-    Set random seeds for reproducible training.
-    """
 
     random.seed(seed)
 
@@ -297,28 +308,17 @@ def set_seed(seed: int) -> None:
 
         torch.cuda.manual_seed_all(seed)
 
-    # --------------------------------------------------------
-    # CUDA deterministic settings
-    #
-    # We deliberately keep these conservative because exact
-    # deterministic CUDA execution can reduce performance.
-    # --------------------------------------------------------
-
-    if torch.cuda.is_available():
-
+        # Performance-oriented setting.
         torch.backends.cudnn.benchmark = True
 
 
-# ============================================================
-# Device Selection
-# ============================================================
+# ======================================================================
+# Device
+# ======================================================================
 
 def get_device(
     requested_device: str,
 ) -> torch.device:
-    """
-    Select the training device.
-    """
 
     if requested_device == "cuda":
 
@@ -335,10 +335,6 @@ def get_device(
 
         return torch.device("cpu")
 
-    # --------------------------------------------------------
-    # Automatic selection
-    # --------------------------------------------------------
-
     if torch.cuda.is_available():
 
         return torch.device("cuda")
@@ -346,16 +342,13 @@ def get_device(
     return torch.device("cpu")
 
 
-# ============================================================
+# ======================================================================
 # Device Information
-# ============================================================
+# ======================================================================
 
 def print_device_information(
     device: torch.device,
 ) -> None:
-    """
-    Display device information.
-    """
 
     print()
     print("=" * 75)
@@ -363,8 +356,7 @@ def print_device_information(
     print("=" * 75)
 
     print(
-        f"PyTorch Version : "
-        f"{torch.__version__}"
+        f"PyTorch Version : {torch.__version__}"
     )
 
     print(
@@ -373,19 +365,14 @@ def print_device_information(
     )
 
     print(
-        f"Selected Device : "
-        f"{device}"
+        f"Selected Device : {device}"
     )
 
     if device.type == "cuda":
 
-        gpu_name = (
-            torch.cuda.get_device_name(0)
-        )
-
         print(
             f"GPU             : "
-            f"{gpu_name}"
+            f"{torch.cuda.get_device_name(0)}"
         )
 
         properties = (
@@ -410,22 +397,16 @@ def print_device_information(
     print("=" * 75)
 
 
-# ============================================================
-# Build Configuration
-# ============================================================
+# ======================================================================
+# Build Model Configuration
+# ======================================================================
 
 def build_config(
     args: argparse.Namespace,
+    device: torch.device,
 ) -> GPTConfig:
-    """
-    Build GPT configuration and apply command-line overrides.
-    """
 
     config = GPTConfig()
-
-    # --------------------------------------------------------
-    # Epochs
-    # --------------------------------------------------------
 
     if args.epochs is not None:
 
@@ -437,10 +418,6 @@ def build_config(
 
         config.max_epochs = args.epochs
 
-    # --------------------------------------------------------
-    # Batch size
-    # --------------------------------------------------------
-
     if args.batch_size is not None:
 
         if args.batch_size <= 0:
@@ -451,41 +428,85 @@ def build_config(
 
         config.batch_size = args.batch_size
 
-    # --------------------------------------------------------
-    # Workers
-    # --------------------------------------------------------
-
     if args.num_workers < 0:
 
         raise ValueError(
             "--num-workers cannot be negative."
         )
 
-    # --------------------------------------------------------
-    # Maximum documents
-    # --------------------------------------------------------
+    # Some existing versions of GPTConfig expose device,
+    # while others do not. Set it only when available.
+    if hasattr(config, "device"):
 
-    if args.max_documents is not None:
-
-        if args.max_documents <= 0:
-
-            raise ValueError(
-                "--max-documents must be greater than zero."
-            )
+        config.device = device.type
 
     return config
 
 
-# ============================================================
-# Parameter Counting
-# ============================================================
+# ======================================================================
+# Convert Configuration to Dictionary
+# ======================================================================
+
+def config_to_dict(
+    config: GPTConfig,
+) -> dict[str, Any]:
+
+    result = {}
+
+    if hasattr(config, "__dict__"):
+
+        for key, value in vars(config).items():
+
+            try:
+
+                json.dumps(value)
+
+                result[key] = value
+
+            except TypeError:
+
+                result[key] = str(value)
+
+    else:
+
+        for key in dir(config):
+
+            if key.startswith("_"):
+
+                continue
+
+            try:
+
+                value = getattr(config, key)
+
+            except Exception:
+
+                continue
+
+            if callable(value):
+
+                continue
+
+            try:
+
+                json.dumps(value)
+
+                result[key] = value
+
+            except TypeError:
+
+                continue
+
+    return result
+
+
+# ======================================================================
+# Parameter Count
+# ======================================================================
 
 def count_parameters(
     model: torch.nn.Module,
 ) -> tuple[int, int]:
-    """
-    Return total and trainable parameter counts.
-    """
 
     total = sum(
         parameter.numel()
@@ -501,21 +522,16 @@ def count_parameters(
     return total, trainable
 
 
-# ============================================================
-# Model Information
-# ============================================================
+# ======================================================================
+# Print Model Information
+# ======================================================================
 
 def print_model_information(
     model: torch.nn.Module,
     config: GPTConfig,
 ) -> None:
-    """
-    Print model configuration and parameter information.
-    """
 
-    total, trainable = (
-        count_parameters(model)
-    )
+    total, trainable = count_parameters(model)
 
     print()
     print("=" * 75)
@@ -570,14 +586,11 @@ def print_model_information(
     print("=" * 75)
 
 
-# ============================================================
-# Tokenizer Verification
-# ============================================================
+# ======================================================================
+# Verify Tokenizer
+# ======================================================================
 
-def verify_tokenizer_path() -> Path:
-    """
-    Verify that the trained tokenizer exists.
-    """
+def load_tokenizer() -> MyGPTTokenizer:
 
     print()
     print("=" * 75)
@@ -587,10 +600,8 @@ def verify_tokenizer_path() -> Path:
     if not DEFAULT_TOKENIZER_PATH.exists():
 
         raise FileNotFoundError(
-            "Tokenizer was not found.\n\n"
-            f"Expected path:\n"
-            f"{DEFAULT_TOKENIZER_PATH}\n\n"
-            "Train the tokenizer before starting GPT training."
+            "Tokenizer not found:\n"
+            f"{DEFAULT_TOKENIZER_PATH}"
         )
 
     size_mb = (
@@ -599,7 +610,7 @@ def verify_tokenizer_path() -> Path:
     )
 
     print(
-        f"Tokenizer       : "
+        f"Path            : "
         f"{DEFAULT_TOKENIZER_PATH}"
     )
 
@@ -608,37 +619,14 @@ def verify_tokenizer_path() -> Path:
         f"{size_mb:.2f} MB"
     )
 
-    print(
-        "Tokenizer       : ✅ FOUND"
-    )
-
-    return DEFAULT_TOKENIZER_PATH
-
-
-# ============================================================
-# Load Tokenizer
-# ============================================================
-
-def load_tokenizer() -> MyGPTTokenizer:
-    """
-    Load the project's trained tokenizer.
-    """
-
-    tokenizer_path = (
-        verify_tokenizer_path()
-    )
-
-    print()
-    print("Loading tokenizer...")
-
     tokenizer = (
         MyGPTTokenizer.load(
-            tokenizer_path
+            DEFAULT_TOKENIZER_PATH
         )
     )
 
     print(
-        "Tokenizer loaded successfully."
+        "Tokenizer       : ✅ LOADED"
     )
 
     print(
@@ -646,108 +634,286 @@ def load_tokenizer() -> MyGPTTokenizer:
         f"{tokenizer.vocabulary_size:,}"
     )
 
+    print("=" * 75)
+
     return tokenizer
 
 
-# ============================================================
-# DataLoader Factory Import
-# ============================================================
+# ======================================================================
+# File Hash
+# ======================================================================
 
-def import_dataloader_factory():
-    """
-    Import create_dataloader from training.dataloader.
-    """
+def sha256_file(
+    path: Path,
+    chunk_size: int = 1024 * 1024,
+) -> str:
 
-    import training.dataloader as dataloader_module
+    digest = hashlib.sha256()
 
-    factory = getattr(
-        dataloader_module,
-        "create_dataloader",
-        None,
+    with path.open("rb") as handle:
+
+        while True:
+
+            chunk = handle.read(chunk_size)
+
+            if not chunk:
+
+                break
+
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+# ======================================================================
+# Dataset Signature
+# ======================================================================
+#
+# We deliberately do NOT hash every Arrow byte.
+#
+# Dataset files can be extremely large.
+#
+# Instead we create a deterministic signature from:
+#
+#     relative path
+#     file size
+#     modification timestamp
+#
+# This catches accidental replacement/modification of the local
+# dataset tree without forcing a multi-GB hashing operation.
+# ======================================================================
+
+def dataset_signature(
+    path: Path,
+) -> str:
+
+    if not path.exists():
+
+        raise FileNotFoundError(
+            f"Dataset path does not exist:\n{path}"
+        )
+
+    entries = []
+
+    if path.is_file():
+
+        stat = path.stat()
+
+        entries.append(
+            (
+                path.name,
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+        )
+
+    else:
+
+        for file_path in sorted(
+            path.rglob("*")
+        ):
+
+            if not file_path.is_file():
+
+                continue
+
+            stat = file_path.stat()
+
+            relative = (
+                file_path
+                .relative_to(path)
+                .as_posix()
+            )
+
+            entries.append(
+                (
+                    relative,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                )
+            )
+
+    payload = json.dumps(
+        entries,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return hashlib.sha256(
+        payload
+    ).hexdigest()
+
+
+# ======================================================================
+# Locked Dataset Manifest
+# ======================================================================
+
+def build_dataset_manifest() -> dict[str, Any]:
+
+    datasets = []
+
+    print()
+    print("=" * 75)
+    print("LOCKED DATASET MIXTURE")
+    print("=" * 75)
+
+    print(
+        "Dataset order is FIXED:"
     )
 
-    if not callable(factory):
+    for index, (
+        name,
+        path,
+    ) in enumerate(
+        LOCKED_DATASETS.items(),
+        start=1,
+    ):
 
-        raise ImportError(
-            "training.dataloader.create_dataloader "
-            "was not found."
+        path = path.resolve()
+
+        if not path.exists():
+
+            raise FileNotFoundError(
+                "\nRequired training dataset "
+                "was not found.\n\n"
+                f"Dataset : {name}\n"
+                f"Path    : {path}\n"
+            )
+
+        signature = dataset_signature(
+            path
         )
 
-    return factory
+        item = {
+            "index": index,
+            "name": name,
+            "path": str(path),
+            "signature": signature,
+        }
+
+        datasets.append(item)
+
+        print()
+        print(
+            f"{index}. {name}"
+        )
+
+        print(
+            f"   Path      : {path}"
+        )
+
+        print(
+            f"   Signature : {signature}"
+        )
+
+    print()
+    print(
+        "Dataset mixture : "
+        "TinyStories + WikiText103 + "
+        "OpenWebText + FineWeb"
+    )
+
+    print("=" * 75)
+
+    return {
+        "locked": True,
+        "order": [
+            item["name"]
+            for item in datasets
+        ],
+        "datasets": datasets,
+    }
 
 
-# ============================================================
-# Create Training DataLoader
-# ============================================================
+# ======================================================================
+# Lock Dataset Module
+# ======================================================================
+#
+# training/dataset.py currently resolves DEFAULT_DATASETS at runtime
+# from the module global. We replace that global with our locked
+# configuration BEFORE creating GPTTextDataset.
+# ======================================================================
 
-def create_train_loader(
-    config,
-    tokenizer,
-    max_documents=None,
-    num_workers=0,
+def lock_dataset_module() -> None:
+
+    import training.dataset as dataset_module
+
+    locked = OrderedDict()
+
+    for name, path in LOCKED_DATASETS.items():
+
+        locked[name] = path.resolve()
+
+    dataset_module.DEFAULT_DATASETS = locked
+
+    print()
+    print(
+        "Dataset module lock : ✅ ENABLED"
+    )
+
+
+# ======================================================================
+# Create Training Dataset
+# ======================================================================
+
+def create_locked_dataset(
+    tokenizer: MyGPTTokenizer,
+    config: GPTConfig,
+    max_documents: int | None,
 ):
     """
-    Create the training DataLoader using the actual
-    training.dataloader.create_dataloader() API.
+    Create GPTTextDataset after locking DEFAULT_DATASETS.
     """
 
-    factory = import_dataloader_factory()
+    lock_dataset_module()
 
-    try:
-        loader = factory(
-            tokenizer=tokenizer,
-            sequence_length=config.max_position_embeddings,
-            batch_size=config.batch_size,
-            max_documents=max_documents,
-            num_workers=num_workers,
-            pin_memory=(config.device == "cuda"),
-            drop_last=True,
-        )
+    from training.dataset import GPTTextDataset
 
-    except Exception as exc:
-        raise RuntimeError(
-            "Unable to create the training DataLoader.\n\n"
-            f"Error: {exc}"
-        ) from exc
+    dataset = GPTTextDataset(
+        dataset_paths=list(
+            LOCKED_DATASETS.values()
+        ),
+        tokenizer=tokenizer,
+        sequence_length=(
+            config.max_position_embeddings
+        ),
+        max_documents=max_documents,
+    )
 
-    if loader is None:
-        raise RuntimeError(
-            "create_dataloader() returned None."
-        )
+    return dataset
+
+
+# ======================================================================
+# Create DataLoader
+# ======================================================================
+
+def create_train_loader(
+    dataset,
+    config: GPTConfig,
+    num_workers: int,
+    device: torch.device,
+):
+
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        num_workers=num_workers,
+        pin_memory=(
+            device.type == "cuda"
+        ),
+        drop_last=True,
+    )
 
     return loader
 
 
-# ============================================================
-# DataLoader Length
-# ============================================================
-
-def get_loader_length(
-    loader,
-) -> int | None:
-    """
-    Safely determine the number of batches.
-    """
-
-    try:
-
-        return len(loader)
-
-    except TypeError:
-
-        return None
-
-
-# ============================================================
-# DataLoader Statistics
-# ============================================================
+# ======================================================================
+# Dataset Statistics
+# ======================================================================
 
 def get_dataset_statistics(
     loader,
-) -> dict | None:
-    """
-    Obtain dataset statistics if supported.
-    """
+) -> dict[str, Any] | None:
 
     dataset = getattr(
         loader,
@@ -759,17 +925,17 @@ def get_dataset_statistics(
 
         return None
 
-    statistics_function = getattr(
+    function = getattr(
         dataset,
         "get_statistics",
         None,
     )
 
-    if callable(statistics_function):
+    if callable(function):
 
         try:
 
-            return statistics_function()
+            return function()
 
         except Exception:
 
@@ -778,22 +944,179 @@ def get_dataset_statistics(
     return None
 
 
-# ============================================================
-# Print DataLoader Information
-# ============================================================
+# ======================================================================
+# Validate Loader
+# ======================================================================
 
-def print_dataloader_information(
+def validate_dataloader(
+    loader,
+    config: GPTConfig,
+) -> None:
+
+    try:
+
+        batches = len(loader)
+
+    except TypeError:
+
+        batches = None
+
+    if batches is not None:
+
+        if batches <= 0:
+
+            raise RuntimeError(
+                "Training DataLoader contains "
+                "zero batches."
+            )
+
+    iterator = iter(loader)
+
+    try:
+
+        batch = next(iterator)
+
+    except StopIteration:
+
+        raise RuntimeError(
+            "Training DataLoader produced "
+            "no batches."
+        )
+
+    if not isinstance(
+        batch,
+        (tuple, list),
+    ):
+
+        raise RuntimeError(
+            "DataLoader must return "
+            "(input_ids, labels)."
+        )
+
+    if len(batch) != 2:
+
+        raise RuntimeError(
+            "DataLoader batch must contain "
+            "exactly two tensors."
+        )
+
+    input_ids, labels = batch
+
+    expected_shape = (
+        config.batch_size,
+        config.max_position_embeddings,
+    )
+
+    if tuple(input_ids.shape) != expected_shape:
+
+        raise RuntimeError(
+            "Unexpected input shape.\n"
+            f"Expected : {expected_shape}\n"
+            f"Actual   : {tuple(input_ids.shape)}"
+        )
+
+    if tuple(labels.shape) != expected_shape:
+
+        raise RuntimeError(
+            "Unexpected label shape.\n"
+            f"Expected : {expected_shape}\n"
+            f"Actual   : {tuple(labels.shape)}"
+        )
+
+    if input_ids.dtype != torch.long:
+
+        raise RuntimeError(
+            "input_ids must be torch.long."
+        )
+
+    if labels.dtype != torch.long:
+
+        raise RuntimeError(
+            "labels must be torch.long."
+        )
+
+    if input_ids.numel():
+
+        minimum = int(
+            input_ids.min().item()
+        )
+
+        maximum = int(
+            input_ids.max().item()
+        )
+
+        if minimum < 0:
+
+            raise RuntimeError(
+                "Negative token IDs detected."
+            )
+
+        if maximum >= config.vocab_size:
+
+            raise RuntimeError(
+                "Token ID exceeds vocabulary.\n"
+                f"Maximum : {maximum}\n"
+                f"Vocab   : {config.vocab_size}"
+            )
+
+    # GPT next-token shift:
+    #
+    # input[1:] == labels[:-1]
+
+    if input_ids.shape[1] >= 2:
+
+        if not torch.equal(
+            input_ids[0, 1:],
+            labels[0, :-1],
+        ):
+
+            raise RuntimeError(
+                "Dataset token shifting is invalid."
+            )
+
+    print()
+    print(
+        "DataLoader validation : ✅ PASSED"
+    )
+
+    print(
+        f"Input Shape           : "
+        f"{tuple(input_ids.shape)}"
+    )
+
+    print(
+        f"Target Shape          : "
+        f"{tuple(labels.shape)}"
+    )
+
+    print(
+        f"Input DType           : "
+        f"{input_ids.dtype}"
+    )
+
+    print(
+        f"Target DType          : "
+        f"{labels.dtype}"
+    )
+
+
+# ======================================================================
+# Print Loader Information
+# ======================================================================
+
+def print_loader_information(
     loader,
     config: GPTConfig,
     max_documents: int | None,
 ) -> int | None:
-    """
-    Display DataLoader and dataset information.
-    """
 
-    num_batches = (
-        get_loader_length(loader)
-    )
+    try:
+
+        batches = len(loader)
+
+    except TypeError:
+
+        batches = None
 
     print()
     print("=" * 75)
@@ -817,26 +1140,21 @@ def print_dataloader_information(
 
     print(
         f"Workers         : "
-        f"{getattr(loader, 'num_workers', 'Unknown')}"
+        f"{getattr(loader, 'num_workers', 0)}"
     )
 
-    if num_batches is not None:
+    if batches is not None:
 
         print(
             f"Batches / Epoch : "
-            f"{num_batches:,}"
+            f"{batches:,}"
         )
 
     else:
 
         print(
-            "Batches / Epoch : "
-            "Unknown"
+            "Batches / Epoch : Unknown"
         )
-
-    # --------------------------------------------------------
-    # Dataset statistics
-    # --------------------------------------------------------
 
     statistics = (
         get_dataset_statistics(loader)
@@ -846,7 +1164,7 @@ def print_dataloader_information(
 
         print()
         print(
-            "Dataset Statistics"
+            "Current Dataset Statistics"
         )
 
         print("-" * 75)
@@ -859,264 +1177,18 @@ def print_dataloader_information(
 
     print("=" * 75)
 
-    return num_batches
+    return batches
 
 
-# ============================================================
-# Validate DataLoader
-# ============================================================
+# ======================================================================
+# Training Step Calculation
+# ======================================================================
 
-def validate_dataloader(
-    loader,
-    config: GPTConfig,
-) -> None:
-    """
-    Verify that the DataLoader contains usable batches.
-    """
-
-    num_batches = (
-        get_loader_length(loader)
-    )
-
-    if num_batches is not None:
-
-        if num_batches <= 0:
-
-            statistics = (
-                get_dataset_statistics(loader)
-            )
-
-            message = (
-                "\nTraining DataLoader contains "
-                "ZERO usable batches.\n\n"
-                f"Sequence Length : "
-                f"{config.max_position_embeddings}\n"
-                f"Batch Size      : "
-                f"{config.batch_size}\n"
-            )
-
-            if statistics:
-
-                message += (
-                    "\nDataset Statistics:\n"
-                    f"{statistics}\n"
-                )
-
-            message += (
-                "\nIncrease --max-documents or "
-                "reduce the test dataset size."
-            )
-
-            raise RuntimeError(
-                message
-            )
-
-    # --------------------------------------------------------
-    # Validate one batch.
-    # --------------------------------------------------------
-
-    try:
-
-        batch = next(iter(loader))
-
-    except StopIteration:
-
-        raise RuntimeError(
-            "Training DataLoader produced "
-            "no batches."
-        )
-
-    if not isinstance(
-        batch,
-        (tuple, list),
-    ):
-
-        raise RuntimeError(
-            "Training DataLoader must return "
-            "(input_ids, labels)."
-        )
-
-    if len(batch) != 2:
-
-        raise RuntimeError(
-            "Training DataLoader batch must "
-            "contain exactly two tensors."
-        )
-
-    input_ids, labels = batch
-
-    if not isinstance(
-        input_ids,
-        torch.Tensor,
-    ):
-
-        raise RuntimeError(
-            "input_ids must be a torch.Tensor."
-        )
-
-    if not isinstance(
-        labels,
-        torch.Tensor,
-    ):
-
-        raise RuntimeError(
-            "labels must be a torch.Tensor."
-        )
-
-    expected_shape = (
-        config.batch_size,
-        config.max_position_embeddings,
-    )
-
-    actual_input_shape = (
-        tuple(input_ids.shape)
-    )
-
-    actual_label_shape = (
-        tuple(labels.shape)
-    )
-
-    # --------------------------------------------------------
-    # Because drop_last=True is used, a complete batch is
-    # expected.
-    # --------------------------------------------------------
-
-    if actual_input_shape != expected_shape:
-
-        raise RuntimeError(
-            "Unexpected input batch shape.\n"
-            f"Expected: {expected_shape}\n"
-            f"Actual:   {actual_input_shape}"
-        )
-
-    if actual_label_shape != expected_shape:
-
-        raise RuntimeError(
-            "Unexpected label batch shape.\n"
-            f"Expected: {expected_shape}\n"
-            f"Actual:   {actual_label_shape}"
-        )
-
-    # --------------------------------------------------------
-    # Token dtype
-    # --------------------------------------------------------
-
-    if input_ids.dtype != torch.long:
-
-        raise RuntimeError(
-            "input_ids must use torch.int64 / torch.long."
-        )
-
-    if labels.dtype != torch.long:
-
-        raise RuntimeError(
-            "labels must use torch.int64 / torch.long."
-        )
-
-    # --------------------------------------------------------
-    # Token range
-    # --------------------------------------------------------
-
-    if input_ids.numel() > 0:
-
-        minimum = (
-            int(input_ids.min().item())
-        )
-
-        maximum = (
-            int(input_ids.max().item())
-        )
-
-        if minimum < 0:
-
-            raise RuntimeError(
-                "Input token IDs contain "
-                "negative values."
-            )
-
-        if maximum >= config.vocab_size:
-
-            raise RuntimeError(
-                "Input token ID exceeds "
-                "configured vocabulary size.\n"
-                f"Maximum token: {maximum}\n"
-                f"Vocabulary:    {config.vocab_size}"
-            )
-
-    # --------------------------------------------------------
-    # Token shift verification
-    # --------------------------------------------------------
-
-    if input_ids.shape[1] >= 2:
-
-        shifted_inputs = (
-            input_ids[0, 1:]
-        )
-
-        shifted_targets = (
-            labels[0, :-1]
-        )
-
-        if not torch.equal(
-            shifted_inputs,
-            shifted_targets,
-        ):
-
-            raise RuntimeError(
-                "Dataset token shifting is invalid."
-            )
-
-    print()
-    print(
-        "DataLoader validation : ✅ PASSED"
-    )
-
-    print(
-        f"Input Shape           : "
-        f"{actual_input_shape}"
-    )
-
-    print(
-        f"Target Shape          : "
-        f"{actual_label_shape}"
-    )
-
-    print(
-        f"Input DType           : "
-        f"{input_ids.dtype}"
-    )
-
-    print(
-        f"Target DType          : "
-        f"{labels.dtype}"
-    )
-
-
-# ============================================================
-# Calculate Training Steps
-# ============================================================
-
-def calculate_training_steps(
-    *,
+def calculate_total_steps(
     batches_per_epoch: int | None,
-    epochs: int,
+    config: GPTConfig,
     max_steps: int | None,
 ) -> int:
-    """
-    Calculate total optimizer steps.
-
-    For a test run:
-
-        --max-steps
-
-    takes priority.
-
-    For full training:
-
-        batches_per_epoch × epochs
-
-    is used.
-    """
 
     if max_steps is not None:
 
@@ -1131,8 +1203,7 @@ def calculate_training_steps(
     if batches_per_epoch is None:
 
         raise RuntimeError(
-            "Unable to determine batches per epoch "
-            "for full training."
+            "Cannot determine total training steps."
         )
 
     if batches_per_epoch <= 0:
@@ -1141,7 +1212,7 @@ def calculate_training_steps(
             "Training DataLoader contains zero batches."
         )
 
-    if epochs <= 0:
+    if config.max_epochs <= 0:
 
         raise ValueError(
             "Training epochs must be greater than zero."
@@ -1149,23 +1220,18 @@ def calculate_training_steps(
 
     return (
         batches_per_epoch
-        * epochs
+        * config.max_epochs
     )
 
 
-# ============================================================
+# ======================================================================
 # Scheduler
-# ============================================================
+# ======================================================================
 
-def build_scheduler(
+def create_training_scheduler(
     optimizer,
     total_steps: int,
 ):
-    """
-    Create the project's scheduler.
-
-    Uses 10% warmup.
-    """
 
     if total_steps <= 0:
 
@@ -1180,10 +1246,6 @@ def build_scheduler(
             * DEFAULT_WARMUP_RATIO
         ),
     )
-
-    # --------------------------------------------------------
-    # Avoid warmup being equal to the entire schedule.
-    # --------------------------------------------------------
 
     if total_steps > 1:
 
@@ -1227,24 +1289,27 @@ def build_scheduler(
     return scheduler
 
 
-# ============================================================
-# Resume Path
-# ============================================================
+# ======================================================================
+# Checkpoint Utilities
+# ======================================================================
+
+def ensure_checkpoint_directory() -> None:
+
+    DEFAULT_CHECKPOINT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
 
 def resolve_resume_path(
-    resume_argument: str | None,
+    argument: str | None,
 ) -> Path | None:
-    """
-    Resolve a resume checkpoint path.
-    """
 
-    if resume_argument is None:
+    if argument is None:
 
         return None
 
-    path = Path(
-        resume_argument
-    )
+    path = Path(argument)
 
     if not path.is_absolute():
 
@@ -1258,38 +1323,382 @@ def resolve_resume_path(
     if not path.exists():
 
         raise FileNotFoundError(
-            "Resume checkpoint does not exist:\n"
+            "Checkpoint does not exist:\n"
             f"{path}"
         )
 
     return path
 
 
-# ============================================================
-# Checkpoint Directory
-# ============================================================
+# ======================================================================
+# Read Checkpoint Safely
+# ======================================================================
 
-def prepare_checkpoint_directory() -> None:
-    """
-    Create checkpoint directory if needed.
-    """
+def read_checkpoint(
+    path: Path,
+) -> dict[str, Any]:
 
-    DEFAULT_CHECKPOINT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    try:
+
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+    except TypeError:
+
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+        )
+
+    if not isinstance(
+        checkpoint,
+        dict,
+    ):
+
+        raise RuntimeError(
+            "Checkpoint is not a dictionary."
+        )
+
+    return checkpoint
+
+
+# ======================================================================
+# Build Training Manifest
+# ======================================================================
+
+def build_training_manifest(
+    config: GPTConfig,
+    tokenizer: MyGPTTokenizer,
+    dataset_manifest: dict[str, Any],
+    total_steps: int,
+) -> dict[str, Any]:
+
+    total_params = None
+
+    # The model parameter count is filled later.
+
+    return {
+        "training_version": TRAINING_VERSION,
+
+        "dataset": dataset_manifest,
+
+        "tokenizer": {
+            "path": str(
+                DEFAULT_TOKENIZER_PATH.resolve()
+            ),
+            "size_bytes": (
+                DEFAULT_TOKENIZER_PATH.stat()
+                .st_size
+            ),
+            "sha256": sha256_file(
+                DEFAULT_TOKENIZER_PATH
+            ),
+            "vocab_size": (
+                tokenizer.vocabulary_size
+            ),
+        },
+
+        "model_config": config_to_dict(
+            config
+        ),
+
+        "training": {
+            "batch_size": config.batch_size,
+            "sequence_length": (
+                config.max_position_embeddings
+            ),
+            "learning_rate": (
+                config.learning_rate
+            ),
+            "weight_decay": (
+                config.weight_decay
+            ),
+            "seed": config.seed,
+            "total_steps": total_steps,
+            "warmup_ratio": (
+                DEFAULT_WARMUP_RATIO
+            ),
+            "checkpoint_interval": (
+                CHECKPOINT_INTERVAL
+            ),
+        },
+    }
+
+
+# ======================================================================
+# Validate Resume Manifest
+# ======================================================================
+
+def validate_resume_manifest(
+    checkpoint: dict[str, Any],
+    current_manifest: dict[str, Any],
+    allow_legacy: bool,
+) -> None:
+
+    saved_manifest = checkpoint.get(
+        "mygpt2_training_manifest"
+    )
+
+    if saved_manifest is None:
+
+        if allow_legacy:
+
+            print()
+            print(
+                "⚠️ LEGACY CHECKPOINT RESUME"
+            )
+
+            print(
+                "Checkpoint does not contain "
+                "the locked-mixture manifest."
+            )
+
+            print(
+                "Dataset safety cannot be fully "
+                "verified."
+            )
+
+            return
+
+        raise RuntimeError(
+            "\nUNSAFE RESUME BLOCKED.\n\n"
+            "This checkpoint was created by an "
+            "older train.py and does not contain "
+            "the locked dataset manifest.\n\n"
+            "This is exactly the type of checkpoint "
+            "that can cause the dataset-mixture problem "
+            "we are fixing.\n\n"
+            "Start a fresh final training run, or "
+            "explicitly use:\n\n"
+            "--allow-legacy-resume\n"
+        )
+
+    # --------------------------------------------------------------
+    # Dataset mixture
+    # --------------------------------------------------------------
+
+    saved_dataset = (
+        saved_manifest.get("dataset", {})
+    )
+
+    current_dataset = (
+        current_manifest.get("dataset", {})
+    )
+
+    if saved_dataset != current_dataset:
+
+        raise RuntimeError(
+            "\nDATASET MIXTURE MISMATCH.\n\n"
+            "The checkpoint was created using a "
+            "different dataset configuration.\n\n"
+            f"Saved:\n"
+            f"{json.dumps(saved_dataset, indent=2)}\n\n"
+            f"Current:\n"
+            f"{json.dumps(current_dataset, indent=2)}"
+        )
+
+    # --------------------------------------------------------------
+    # Tokenizer
+    # --------------------------------------------------------------
+
+    saved_tokenizer = (
+        saved_manifest.get(
+            "tokenizer",
+            {},
+        )
+    )
+
+    current_tokenizer = (
+        current_manifest.get(
+            "tokenizer",
+            {},
+        )
+    )
+
+    if saved_tokenizer != current_tokenizer:
+
+        raise RuntimeError(
+            "\nTOKENIZER MISMATCH.\n\n"
+            "The tokenizer used by the checkpoint "
+            "does not match the current tokenizer."
+        )
+
+    # --------------------------------------------------------------
+    # Model configuration
+    # --------------------------------------------------------------
+
+    saved_model = (
+        saved_manifest.get(
+            "model_config",
+            {},
+        )
+    )
+
+    current_model = (
+        current_manifest.get(
+            "model_config",
+            {},
+        )
+    )
+
+    # Device can legitimately differ between runs.
+    saved_model = dict(saved_model)
+    current_model = dict(current_model)
+
+    saved_model.pop("device", None)
+    current_model.pop("device", None)
+
+    if saved_model != current_model:
+
+        raise RuntimeError(
+            "\nMODEL CONFIGURATION MISMATCH.\n\n"
+            "The checkpoint model configuration "
+            "does not match the current model."
+        )
+
+    # --------------------------------------------------------------
+    # Critical training parameters
+    # --------------------------------------------------------------
+
+    saved_training = (
+        saved_manifest.get(
+            "training",
+            {},
+        )
+    )
+
+    current_training = (
+        current_manifest.get(
+            "training",
+            {},
+        )
+    )
+
+    critical_keys = [
+        "batch_size",
+        "sequence_length",
+        "learning_rate",
+        "weight_decay",
+        "seed",
+        "warmup_ratio",
+    ]
+
+    for key in critical_keys:
+
+        if (
+            saved_training.get(key)
+            != current_training.get(key)
+        ):
+
+            raise RuntimeError(
+                "\nTRAINING CONFIGURATION MISMATCH.\n\n"
+                f"Parameter : {key}\n"
+                f"Saved     : "
+                f"{saved_training.get(key)}\n"
+                f"Current   : "
+                f"{current_training.get(key)}"
+            )
+
+    print()
+    print(
+        "Resume manifest validation : ✅ PASSED"
     )
 
 
-# ============================================================
-# GPU Memory Information
-# ============================================================
+# ======================================================================
+# Add Manifest to Checkpoint
+# ======================================================================
+
+def save_checkpoint_with_manifest(
+    trainer,
+    filename: str,
+    manifest: dict[str, Any],
+) -> Path:
+
+    ensure_checkpoint_directory()
+
+    # First let the existing Trainer create the checkpoint.
+    #
+    # This preserves the project's existing checkpoint format.
+
+    created = trainer.save(
+        filename
+    )
+
+    path = Path(created)
+
+    if not path.is_absolute():
+
+        path = (
+            PROJECT_ROOT
+            / path
+        )
+
+    path = path.resolve()
+
+    checkpoint = read_checkpoint(
+        path
+    )
+
+    checkpoint[
+        "mygpt2_training_manifest"
+    ] = manifest
+
+    checkpoint[
+        "mygpt2_checkpoint_version"
+    ] = TRAINING_VERSION
+
+    checkpoint[
+        "mygpt2_checkpoint_saved_at"
+    ] = time.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    # --------------------------------------------------------------
+    # Atomic replacement
+    # --------------------------------------------------------------
+
+    temp_path = path.with_suffix(
+        ".tmp"
+    )
+
+    try:
+
+        torch.save(
+            checkpoint,
+            temp_path,
+        )
+
+        os.replace(
+            temp_path,
+            path,
+        )
+
+    finally:
+
+        if temp_path.exists():
+
+            try:
+
+                temp_path.unlink()
+
+            except Exception:
+
+                pass
+
+    return path
+
+
+# ======================================================================
+# Print GPU Memory
+# ======================================================================
 
 def print_gpu_memory(
     device: torch.device,
 ) -> None:
-    """
-    Print current GPU memory usage.
-    """
 
     if device.type != "cuda":
 
@@ -1320,26 +1729,59 @@ def print_gpu_memory(
     )
 
 
-# ============================================================
+# ======================================================================
+# Create Trainer
+# ======================================================================
+
+def create_training_trainer(
+    model,
+    train_loader,
+    config,
+    optimizer,
+    scheduler,
+    device,
+):
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        config=config,
+        val_loader=None,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+    )
+
+    return trainer
+
+
+# ======================================================================
 # Print Training Plan
-# ============================================================
+# ======================================================================
 
 def print_training_plan(
-    *,
     config: GPTConfig,
     batches_per_epoch: int | None,
     total_steps: int,
     max_steps: int | None,
     max_documents: int | None,
 ) -> None:
-    """
-    Print the complete training plan.
-    """
 
     print()
     print("=" * 75)
-    print("Training Plan")
+    print("FINAL TRAINING PLAN")
     print("=" * 75)
+
+    print(
+        "Dataset Mixture : "
+        "LOCKED"
+    )
+
+    print(
+        "Datasets        : "
+        "TinyStories, WikiText103, "
+        "OpenWebText, FineWeb"
+    )
 
     print(
         f"Epochs          : "
@@ -1356,6 +1798,11 @@ def print_training_plan(
         f"{config.max_position_embeddings}"
     )
 
+    print(
+        f"Max Documents   : "
+        f"{max_documents if max_documents is not None else 'ALL'}"
+    )
+
     if batches_per_epoch is not None:
 
         print(
@@ -1366,133 +1813,92 @@ def print_training_plan(
     else:
 
         print(
-            "Batches / Epoch : "
-            "Unknown"
+            "Batches / Epoch : Unknown"
         )
 
     print(
-        f"Total Steps     : "
+        f"Target Steps    : "
         f"{total_steps:,}"
-    )
-
-    print(
-        f"Max Documents   : "
-        f"{max_documents if max_documents is not None else 'ALL'}"
     )
 
     if max_steps is not None:
 
         print(
-            f"Test Mode       : "
-            f"MAX {max_steps:,} STEPS"
+            "Training Mode   : "
+            "STEP-LIMITED"
         )
 
     else:
 
         print(
-            "Test Mode       : NO"
+            "Training Mode   : "
+            "EPOCH-BASED"
         )
 
+    print(
+        "Checkpointing   : "
+        "EVERY 1000 STEPS"
+    )
+
+    print(
+        "Resume Safety   : "
+        "ENABLED"
+    )
+
     print("=" * 75)
 
 
-# ============================================================
-# Create Trainer
-# ============================================================
+# ======================================================================
+# Step-Limited Training
+# ======================================================================
 
-def create_training_trainer(
-    *,
-    model,
-    train_loader,
-    config,
-    optimizer,
-    scheduler,
-    device,
-):
-    """
-    Construct the existing Trainer.
-    """
-
-    print()
-    print(
-        "Creating Trainer..."
-    )
-
-    trainer = Trainer(
-        model=model,
-
-        train_loader=train_loader,
-
-        config=config,
-
-        val_loader=None,
-
-        optimizer=optimizer,
-
-        scheduler=scheduler,
-
-        device=device,
-    )
-
-    print(
-        "Trainer created successfully."
-    )
-
-    return trainer
-
-
-# ============================================================
-# Run Short Test
-# ============================================================
-
-def run_short_test(
-    *,
+def run_step_limited_training(
     trainer,
     train_loader,
-    max_steps: int,
+    target_steps: int,
     no_save: bool,
+    manifest: dict[str, Any],
     device: torch.device,
 ) -> None:
-    """
-    Run an exact optimizer-step test.
-
-    This deliberately uses the existing Trainer.train_step()
-    so the already-tested Trainer remains the owner of:
-
-        forward
-        loss
-        backward
-        optimizer.step
-        scheduler.step
-    """
 
     print()
     print("=" * 75)
-    print("Starting Training")
+    print("Starting FINAL Step-Limited Training")
     print("=" * 75)
 
     print(
-        f"Device          : "
-        f"{device}"
+        f"Starting Step   : "
+        f"{trainer.global_step:,}"
     )
 
     print(
-        f"Max Steps       : "
-        f"{max_steps}"
+        f"Target Step     : "
+        f"{target_steps:,}"
+    )
+
+    print(
+        "Dataset Mixture : "
+        "LOCKED"
+    )
+
+    print(
+        "Checkpointing   : "
+        f"{'ENABLED' if not no_save else 'DISABLED'}"
     )
 
     print("=" * 75)
 
     start_time = time.time()
 
-    completed_steps = 0
-
     data_iterator = iter(
         train_loader
     )
 
+    dataset_pass = 1
+
     while (
-        completed_steps < max_steps
+        trainer.global_step
+        < target_steps
     ):
 
         try:
@@ -1503,13 +1909,36 @@ def run_short_test(
 
         except StopIteration:
 
+            dataset_pass += 1
+
             print()
             print(
-                "WARNING: DataLoader ended "
-                f"before {max_steps} steps."
+                "=" * 75
             )
 
-            break
+            print(
+                "Dataset pass completed."
+            )
+
+            print(
+                f"Starting pass    : "
+                f"{dataset_pass}"
+            )
+
+            print(
+                f"Current Step     : "
+                f"{trainer.global_step:,}"
+            )
+
+            print(
+                "=" * 75
+            )
+
+            data_iterator = iter(
+                train_loader
+            )
+
+            continue
 
         if not isinstance(
             batch,
@@ -1517,15 +1946,15 @@ def run_short_test(
         ):
 
             raise RuntimeError(
-                "Training DataLoader must "
-                "return (input_ids, labels)."
+                "DataLoader must return "
+                "(input_ids, labels)."
             )
 
         if len(batch) != 2:
 
             raise RuntimeError(
-                "Training DataLoader batch "
-                "must contain exactly two tensors."
+                "DataLoader batch must contain "
+                "exactly two tensors."
             )
 
         input_ids, labels = batch
@@ -1534,8 +1963,6 @@ def run_short_test(
             input_ids,
             labels,
         )
-
-        completed_steps += 1
 
         print(
             f"Step "
@@ -1546,31 +1973,79 @@ def run_short_test(
             f"{trainer.get_learning_rate():.8f}"
         )
 
-    # --------------------------------------------------------
-    # Checkpoint
-    # --------------------------------------------------------
+        # ----------------------------------------------------------
+        # Periodic checkpoint
+        # ----------------------------------------------------------
 
-    checkpoint_path = None
+        if (
+            not no_save
+            and trainer.global_step
+            % CHECKPOINT_INTERVAL
+            == 0
+        ):
+
+            checkpoint_name = (
+                f"step_"
+                f"{trainer.global_step:08d}"
+                f".pt"
+            )
+
+            try:
+
+                path = (
+                    save_checkpoint_with_manifest(
+                        trainer,
+                        checkpoint_name,
+                        manifest,
+                    )
+                )
+
+                print()
+                print(
+                    "Checkpoint saved : "
+                    f"{path}"
+                )
+
+            except Exception as exc:
+
+                print()
+                print(
+                    "WARNING: checkpoint save failed."
+                )
+
+                print(
+                    f"Reason : {exc}"
+                )
+
+                print(
+                    "Training will continue."
+                )
+
+    # --------------------------------------------------------------
+    # Final checkpoint
+    # --------------------------------------------------------------
 
     if not no_save:
 
-        prepare_checkpoint_directory()
+        final_name = (
+            f"final_step_"
+            f"{trainer.global_step:08d}"
+            f".pt"
+        )
 
-        checkpoint_path = (
-            trainer.save(
-                "pipeline_test.pt"
+        path = (
+            save_checkpoint_with_manifest(
+                trainer,
+                final_name,
+                manifest,
             )
         )
 
         print()
         print(
-            f"Test checkpoint : "
-            f"{checkpoint_path}"
+            "Final checkpoint : "
+            f"{path}"
         )
-
-    # --------------------------------------------------------
-    # Final statistics
-    # --------------------------------------------------------
 
     elapsed = (
         time.time()
@@ -1579,45 +2054,44 @@ def run_short_test(
 
     print()
     print("=" * 75)
-    print("Pipeline Test Completed")
+    print("FINAL TRAINING COMPLETED")
     print("=" * 75)
 
     print(
-        f"Steps           : "
-        f"{trainer.global_step}"
+        f"Global Step     : "
+        f"{trainer.global_step:,}"
     )
 
-    current_loss = getattr(
-        trainer,
-        "current_train_loss",
-        float("inf"),
+    print(
+        f"Target Step     : "
+        f"{target_steps:,}"
+    )
+
+    print(
+        f"Dataset Passes  : "
+        f"{dataset_pass}"
     )
 
     print(
         f"Final Loss      : "
-        f"{current_loss:.6f}"
+        f"{trainer.current_train_loss:.6f}"
     )
 
     print(
         f"Elapsed Time    : "
-        f"{elapsed:.2f}s"
+        f"{elapsed / 3600:.2f} hours"
     )
 
-    if (
-        trainer.global_step
-        >= max_steps
-    ):
+    if trainer.global_step >= target_steps:
 
         print(
-            "Status          : "
-            "✅ PASSED"
+            "Status          : ✅ PASSED"
         )
 
     else:
 
         print(
-            "Status          : "
-            "⚠️ INCOMPLETE"
+            "Status          : ⚠️ INCOMPLETE"
         )
 
     if device.type == "cuda":
@@ -1631,92 +2105,36 @@ def run_short_test(
     print("=" * 75)
 
 
-# ============================================================
-# Run Full Training
-# ============================================================
+# ======================================================================
+# Full Epoch Training
+# ======================================================================
 
-def run_full_training(
-    *,
+def run_epoch_training(
     trainer,
     config: GPTConfig,
     no_save: bool,
-    no_validation: bool,
 ) -> None:
-    """
-    Run full training through the existing Trainer.
-
-    The Trainer remains responsible for the actual epoch
-    training logic.
-    """
 
     print()
     print("=" * 75)
-    print("Starting Full Training")
+    print("Starting Epoch-Based Training")
     print("=" * 75)
-
-    print(
-        f"Epochs          : "
-        f"{config.max_epochs}"
-    )
-
-    print(
-        f"Batch Size      : "
-        f"{config.batch_size}"
-    )
-
-    print(
-        f"Sequence Length : "
-        f"{config.max_position_embeddings}"
-    )
-
-    print(
-        f"Learning Rate   : "
-        f"{config.learning_rate}"
-    )
-
-    print("=" * 75)
-
-    start_time = time.time()
 
     trainer.train(
         save_every_epoch=(
             not no_save
         ),
-
-        validate_every_epoch=(
-            not no_validation
-        ),
-    )
-
-    elapsed = (
-        time.time()
-        - start_time
+        validate_every_epoch=False,
     )
 
     print()
     print("=" * 75)
-    print("Training Process Finished")
+    print("Epoch Training Completed")
     print("=" * 75)
 
     print(
-        f"Total Time      : "
-        f"{elapsed / 3600:.2f} hours"
-    )
-
-    print(
-        f"Global Steps    : "
+        f"Global Step     : "
         f"{trainer.global_step:,}"
-    )
-
-    total_tokens = getattr(
-        trainer,
-        "total_tokens",
-        0,
-    )
-
-    print(
-        f"Tokens Seen     : "
-        f"{total_tokens:,}"
     )
 
     current_loss = getattr(
@@ -1728,41 +2146,41 @@ def run_full_training(
     if current_loss is not None:
 
         print(
-            f"Final Train Loss: "
+            f"Final Loss      : "
             f"{current_loss:.6f}"
         )
 
     print("=" * 75)
 
 
-# ============================================================
+# ======================================================================
 # Main
-# ============================================================
+# ======================================================================
 
 def main() -> None:
-    """
-    Main MyGPT2 training entry point.
-    """
 
     args = parse_arguments()
 
-    # --------------------------------------------------------
-    # Header
-    # --------------------------------------------------------
-
     print()
     print("=" * 75)
-    print("MyGPT2 Training")
+    print("MyGPT2 FINAL TRAINING")
     print("=" * 75)
 
     print(
-        f"Project Root    : "
+        f"Training Version : "
+        f"{TRAINING_VERSION}"
+    )
+
+    print(
+        f"Project Root     : "
         f"{PROJECT_ROOT}"
     )
 
-    # --------------------------------------------------------
+    print("=" * 75)
+
+    # ==================================================================
     # Device
-    # --------------------------------------------------------
+    # ==================================================================
 
     device = get_device(
         args.device
@@ -1772,17 +2190,18 @@ def main() -> None:
         device
     )
 
-    # --------------------------------------------------------
+    # ==================================================================
     # Configuration
-    # --------------------------------------------------------
+    # ==================================================================
 
     config = build_config(
-        args
+        args,
+        device,
     )
 
-    # --------------------------------------------------------
+    # ==================================================================
     # Seed
-    # --------------------------------------------------------
+    # ==================================================================
 
     set_seed(
         config.seed
@@ -1793,15 +2212,11 @@ def main() -> None:
         f"{config.seed}"
     )
 
-    # --------------------------------------------------------
+    # ==================================================================
     # Tokenizer
-    # --------------------------------------------------------
+    # ==================================================================
 
     tokenizer = load_tokenizer()
-
-    # --------------------------------------------------------
-    # Vocabulary verification
-    # --------------------------------------------------------
 
     if (
         tokenizer.vocabulary_size
@@ -1809,17 +2224,113 @@ def main() -> None:
     ):
 
         raise RuntimeError(
-            "Tokenizer vocabulary size does not "
-            "match GPT configuration.\n\n"
-            f"Tokenizer: "
+            "Tokenizer vocabulary does not match "
+            "GPT configuration.\n\n"
+            f"Tokenizer : "
             f"{tokenizer.vocabulary_size}\n"
-            f"Config:    "
+            f"Config    : "
             f"{config.vocab_size}"
         )
 
-    # --------------------------------------------------------
+    # ==================================================================
+    # Dataset Manifest
+    # ==================================================================
+
+    dataset_manifest = (
+        build_dataset_manifest()
+    )
+
+    # ==================================================================
+    # Dataset
+    # ==================================================================
+
+    print()
+    print("=" * 75)
+    print("Creating LOCKED Training Dataset")
+    print("=" * 75)
+
+    train_dataset = (
+        create_locked_dataset(
+            tokenizer=tokenizer,
+            config=config,
+            max_documents=args.max_documents,
+        )
+    )
+
+    print(
+        "Training Dataset : ✅ CREATED"
+    )
+
+    # ==================================================================
+    # DataLoader
+    # ==================================================================
+
+    train_loader = (
+        create_train_loader(
+            dataset=train_dataset,
+            config=config,
+            num_workers=args.num_workers,
+            device=device,
+        )
+    )
+
+    batches_per_epoch = (
+        print_loader_information(
+            train_loader,
+            config,
+            args.max_documents,
+        )
+    )
+
+    # ==================================================================
+    # DataLoader Validation
+    # ==================================================================
+
+    validate_dataloader(
+        train_loader,
+        config,
+    )
+
+    # ==================================================================
+    # Training Steps
+    # ==================================================================
+
+    total_steps = (
+        calculate_total_steps(
+            batches_per_epoch,
+            config,
+            args.max_steps,
+        )
+    )
+
+    # ==================================================================
+    # Manifest
+    # ==================================================================
+
+    manifest = (
+        build_training_manifest(
+            config=config,
+            tokenizer=tokenizer,
+            dataset_manifest=dataset_manifest,
+            total_steps=total_steps,
+        )
+    )
+
+    # ==================================================================
+    # Training Plan
+    # ==================================================================
+
+    print_training_plan(
+        config=config,
+        batches_per_epoch=batches_per_epoch,
+        total_steps=total_steps,
+        max_steps=args.max_steps,
+        max_documents=args.max_documents,
+    )
+
+    # ==================================================================
     # Model
-    # --------------------------------------------------------
+    # ==================================================================
 
     print()
     print(
@@ -1843,75 +2354,24 @@ def main() -> None:
         config,
     )
 
-    # --------------------------------------------------------
-    # DataLoader
-    # --------------------------------------------------------
+    # ==================================================================
+    # Add parameter count to manifest
+    # ==================================================================
 
-    train_loader = (
-        create_train_loader(
-            config=config,
-            tokenizer=tokenizer,
-            max_documents=args.max_documents,
-            num_workers=args.num_workers,
-        )
+    total_params, trainable_params = (
+        count_parameters(model)
     )
 
-    batches_per_epoch = (
-        print_dataloader_information(
-            train_loader,
-            config,
-            args.max_documents,
-        )
-    )
+    manifest[
+        "model_parameters"
+    ] = {
+        "total": total_params,
+        "trainable": trainable_params,
+    }
 
-    # --------------------------------------------------------
-    # Validate DataLoader
-    # --------------------------------------------------------
-
-    validate_dataloader(
-        train_loader,
-        config,
-    )
-
-    # --------------------------------------------------------
-    # Calculate training steps
-    # --------------------------------------------------------
-
-    total_steps = (
-        calculate_training_steps(
-            batches_per_epoch=(
-                batches_per_epoch
-            ),
-
-            epochs=(
-                config.max_epochs
-            ),
-
-            max_steps=(
-                args.max_steps
-            ),
-        )
-    )
-
-    print_training_plan(
-        config=config,
-        batches_per_epoch=(
-            batches_per_epoch
-        ),
-        total_steps=(
-            total_steps
-        ),
-        max_steps=(
-            args.max_steps
-        ),
-        max_documents=(
-            args.max_documents
-        ),
-    )
-
-    # --------------------------------------------------------
+    # ==================================================================
     # Optimizer
-    # --------------------------------------------------------
+    # ==================================================================
 
     print()
     print(
@@ -1925,21 +2385,28 @@ def main() -> None:
     )
 
     print(
-        "Optimizer created successfully."
+        "Optimizer       : ✅ CREATED"
     )
 
-    # --------------------------------------------------------
+    # ==================================================================
     # Scheduler
-    # --------------------------------------------------------
+    # ==================================================================
 
-    scheduler = build_scheduler(
-        optimizer=optimizer,
-        total_steps=total_steps,
+    scheduler = (
+        create_training_scheduler(
+            optimizer=optimizer,
+            total_steps=total_steps,
+        )
     )
 
-    # --------------------------------------------------------
+    # ==================================================================
     # Trainer
-    # --------------------------------------------------------
+    # ==================================================================
+
+    print()
+    print(
+        "Creating Trainer..."
+    )
 
     trainer = create_training_trainer(
         model=model,
@@ -1950,9 +2417,13 @@ def main() -> None:
         device=device,
     )
 
-    # --------------------------------------------------------
+    print(
+        "Trainer         : ✅ CREATED"
+    )
+
+    # ==================================================================
     # Resume
-    # --------------------------------------------------------
+    # ==================================================================
 
     resume_path = (
         resolve_resume_path(
@@ -1964,12 +2435,39 @@ def main() -> None:
 
         print()
         print("=" * 75)
-        print("Resuming Training")
+        print("RESUME REQUEST")
         print("=" * 75)
 
         print(
-            f"Checkpoint      : "
+            f"Checkpoint : "
             f"{resume_path}"
+        )
+
+        # --------------------------------------------------------------
+        # Inspect manifest BEFORE loading trainer state.
+        # --------------------------------------------------------------
+
+        checkpoint = (
+            read_checkpoint(
+                resume_path
+            )
+        )
+
+        validate_resume_manifest(
+            checkpoint=checkpoint,
+            current_manifest=manifest,
+            allow_legacy=(
+                args.allow_legacy_resume
+            ),
+        )
+
+        # --------------------------------------------------------------
+        # Restore model / optimizer / scheduler / RNG.
+        # --------------------------------------------------------------
+
+        print()
+        print(
+            "Loading checkpoint state..."
         )
 
         trainer.load(
@@ -1984,308 +2482,67 @@ def main() -> None:
 
         print(
             f"Restored Step   : "
-            f"{trainer.global_step}"
-        )
-
-        print(
-            "Checkpoint      : "
-            "✅ LOADED"
-        )
-
-        print("=" * 75)
-
-    # --------------------------------------------------------
-    # Short test mode
-    # --------------------------------------------------------
-
-    if args.max_steps is not None:
-
-        target_steps = args.max_steps
-
-        if target_steps <= 0:
-            raise ValueError(
-                "--max-steps must be greater than zero."
-            )
-
-        print()
-        print("=" * 75)
-        print("Step-Limited Training")
-        print("=" * 75)
-        print(
-            f"Target Steps    : {target_steps:,}"
-        )
-        print(
-            "Dataset Cycling : ENABLED"
-        )
-        print(
-            "Checkpointing   : ENABLED"
-            if not args.no_save
-            else
-            "Checkpointing   : DISABLED"
-        )
-        print("=" * 75)
-
-        # --------------------------------------------------------
-        # Create the first iterator
-        # --------------------------------------------------------
-
-        data_iterator = iter(train_loader)
-
-        dataset_pass = 1
-
-        start_time = time.time()
-
-        print()
-        print(
-            f"Starting dataset pass {dataset_pass}..."
-        )
-        while trainer.global_step < target_steps:
-
-            # ----------------------------------------------------
-            # Get next batch
-            # ----------------------------------------------------
-
-            try:
-
-                batch = next(data_iterator)
-
-            except StopIteration:
-
-                # ------------------------------------------------
-                # Dataset exhausted.
-                #
-                # IMPORTANT:
-                # We do NOT stop training.
-                # We simply start another pass.
-                # ------------------------------------------------
-
-                dataset_pass += 1
-
-                print()
-                print(
-                    "=" * 75
-                )
-
-                print(
-                    "Dataset exhausted."
-                )
-
-                print(
-                    f"Starting dataset pass "
-                    f"{dataset_pass}..."
-                )
-
-                print(
-                    f"Current Step    : "
-                    f"{trainer.global_step:,}"
-                )
-
-                print(
-                    "=" * 75
-                )
-
-                data_iterator = iter(
-                    train_loader
-                )
-
-                continue
-
-            # ----------------------------------------------------
-            # Validate batch
-            # ----------------------------------------------------
-
-            if not isinstance(
-                batch,
-                (tuple, list),
-            ):
-
-                raise RuntimeError(
-                    "Training DataLoader must "
-                    "return (input_ids, labels)."
-                )
-
-            if len(batch) != 2:
-
-                raise RuntimeError(
-                    "Training DataLoader batch "
-                    "must contain exactly two tensors."
-                )
-
-            input_ids, labels = batch
-
-            # ----------------------------------------------------
-            # Training step
-            # ----------------------------------------------------
-
-            loss = trainer.train_step(
-                input_ids,
-                labels,
-            )
-
-            # ----------------------------------------------------
-            # Progress
-            # ----------------------------------------------------
-
-            print(
-                f"Step "
-                f"{trainer.global_step:>6} | "
-                f"Loss "
-                f"{loss:.6f} | "
-                f"LR "
-                f"{trainer.get_learning_rate():.8f}"
-            )
-
-            # ----------------------------------------------------
-            # Safety checkpoint
-            #
-            # Save every 1000 steps.
-            #
-            # We use a unique filename so Windows does not have
-            # to replace an existing checkpoint file.
-            # ----------------------------------------------------
-
-            if (
-                not args.no_save
-                and trainer.global_step % 1000 == 0
-            ):
-
-                checkpoint_name = (
-                    f"step_{trainer.global_step:08d}.pt"
-                )
-
-                try:
-
-                    checkpoint_path = trainer.save(
-                        checkpoint_name
-                    )
-
-                    print()
-                    print(
-                        "Checkpoint saved : "
-                        f"{checkpoint_path}"
-                    )
-
-                except Exception as exc:
-
-                    print()
-                    print(
-                        "WARNING: Checkpoint save failed."
-                    )
-
-                    print(
-                        f"Reason          : {exc}"
-                    )
-
-                    print(
-                        "Training will continue."
-                    )
-
-        # --------------------------------------------------------
-        # Final checkpoint
-        # --------------------------------------------------------
-
-        if not args.no_save:
-
-            checkpoint_name = (
-                f"final_step_{trainer.global_step:08d}.pt"
-            )
-
-            try:
-
-                final_checkpoint = trainer.save(
-                    checkpoint_name
-                )
-
-                print()
-                print(
-                    f"Final checkpoint : "
-                    f"{final_checkpoint}"
-                )
-
-            except Exception as exc:
-
-                print()
-                print(
-                    "WARNING: Final checkpoint save failed."
-                )
-
-                print(
-                    f"Reason          : {exc}"
-                )
-
-        # --------------------------------------------------------
-        # Summary
-        # --------------------------------------------------------
-        start_time = time.time()
-        elapsed = (
-            time.time()
-            - start_time
-        )
-        
-        print()
-        print("=" * 75)
-        print("Step-Limited Training Completed")
-        print("=" * 75)
-
-        print(
-            f"Steps           : "
             f"{trainer.global_step:,}"
         )
 
         print(
-            f"Target Steps    : "
-            f"{target_steps:,}"
+            "Checkpoint      : ✅ LOADED"
         )
-
-        print(
-            f"Dataset Passes  : "
-            f"{dataset_pass}"
-        )
-
-        print(
-            f"Final Loss      : "
-            f"{trainer.current_train_loss:.6f}"
-        )
-
-        print(
-            f"Elapsed Time    : "
-            f"{elapsed:.2f}s"
-        )
-        
-        if trainer.global_step >= target_steps:
-
-            print(
-                "Status          : ✅ PASSED"
-            )
-
-        else:
-
-            print(
-                "Status          : ⚠️ INCOMPLETE"
-            )
 
         print("=" * 75)
 
+        # --------------------------------------------------------------
+        # Never allow a target below the restored step.
+        # --------------------------------------------------------------
+
+        if (
+            args.max_steps is not None
+            and args.max_steps
+            <= trainer.global_step
+        ):
+
+            raise RuntimeError(
+                "\nINVALID RESUME TARGET.\n\n"
+                f"Checkpoint step : "
+                f"{trainer.global_step:,}\n"
+                f"Requested target: "
+                f"{args.max_steps:,}\n\n"
+                "The requested target must be greater "
+                "than the restored checkpoint step."
+            )
+
+    # ==================================================================
+    # Step-Limited Training
+    # ==================================================================
+
+    if args.max_steps is not None:
+
+        run_step_limited_training(
+            trainer=trainer,
+            train_loader=train_loader,
+            target_steps=args.max_steps,
+            no_save=args.no_save,
+            manifest=manifest,
+            device=device,
+        )
+
         return
 
-    # --------------------------------------------------------
-    # Full training
-    # --------------------------------------------------------
+    # ==================================================================
+    # Epoch Training
+    # ==================================================================
 
-    run_full_training(
+    run_epoch_training(
         trainer=trainer,
-
         config=config,
-
         no_save=args.no_save,
-
-        no_validation=args.no_validation,
     )
 
 
-# ============================================================
+# ======================================================================
 # Entry Point
-# ============================================================
+# ======================================================================
 
 if __name__ == "__main__":
+
     main()

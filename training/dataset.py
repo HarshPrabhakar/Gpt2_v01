@@ -1128,11 +1128,11 @@ if __name__ == "__main__":
     # Test configuration
     # --------------------------------------------------------
 
-    sequence_length = 32
+    sequence_length = 512
 
     batch_size = 4
 
-    max_documents = 20
+    max_documents = 10000
 
     print(
         "Dataset configuration:"

@@ -1,9 +1,9 @@
 {
     "checkpoint": {
-        "path": "D:\\Gpt2_v01\\artifacts\\checkpoints\\final_step_00010000.pt",
+        "path": "D:\\Gpt2_v01\\artifacts\\checkpoints\\final_step_00020000.pt",
         "version": "1.2",
         "epoch": 0,
-        "global_step": 10000
+        "global_step": 20000
     },
     "model": {
         "parameters": 110025216,
@@ -25,16 +25,16 @@
         "tokens_evaluated": 499712
     },
     "metrics": {
-        "training_loss": 1.3898952007293701,
-        "validation_loss": 3.4182219153544944,
-        "training_perplexity": 4.014429321683512,
-        "validation_perplexity": 30.515108308852685,
-        "top1_accuracy": 0.40857734054815575,
-        "top5_accuracy": 0.6624695824795082,
-        "top10_accuracy": 0.7372686667520492
+        "training_loss": 5.986759185791016,
+        "validation_loss": 3.5312803534210704,
+        "training_perplexity": 398.12227662115373,
+        "validation_perplexity": 34.167686335164674,
+        "top1_accuracy": 0.3668473040471312,
+        "top5_accuracy": 0.6272232806096312,
+        "top10_accuracy": 0.7076696176997951
     },
     "evaluation": {
         "device": "cuda",
-        "evaluation_time_seconds": 18.27775812149048
+        "evaluation_time_seconds": 18.603393077850342
     }
 }

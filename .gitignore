@@ -17,8 +17,33 @@ venv/
 # Training artifacts
 artifacts/checkpoints/
 artifacts/logs/
+artifacts/instruct_checkpoints/
+artifacts/instruct_datasets/
+
 
 # Hugging Face / dataset cache
 .cache/
 .cache/
 huggingface/
+
+
+
+# ============================================================
+# Generated instruction datasets
+# ============================================================
+artifacts/instruct_datasets/*.jsonl
+artifacts/instruct_datasets/smol_smoltalk_raw/
+
+# ============================================================
+# Model checkpoints
+# ============================================================
+artifacts/checkpoints/*.pt
+artifacts/instruct_checkpoints/*.pt
+artifacts/checkpoints/*.tmp
+artifacts/instruct_checkpoints/*.tmp
+
+# ============================================================
+# Python cache
+# ============================================================
+__pycache__/
+*.pyc

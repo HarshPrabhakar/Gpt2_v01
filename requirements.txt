@@ -35,3 +35,5 @@ matplotlib>=3.10.0
 # TensorBoard Logging
 
 tensorboard>=2.20.0
+
+gradio>=4.42.1

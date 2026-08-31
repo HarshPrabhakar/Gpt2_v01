@@ -1,1254 +1,654 @@
-"""
-============================================================
-MyGPT2 - Training Dataset
-============================================================
-
-Purpose
--------
-Converts the project's text datasets into training samples
-for the MyGPT2 language model.
-
-Pipeline:
-
-    Raw Dataset
-        |
-        v
-    Training Documents ONLY
-        |
-        v
-    MyGPTTokenizer
-        |
-        v
-    Token IDs
-        |
-        v
-    Fixed-Length Sequences
-        |
-        v
-    Input IDs + Target IDs
-        |
-        v
-    PyTorch IterableDataset
-        |
-        v
-    DataLoader
-        |
-        v
-    GPU
-        |
-        v
-    MyGPT2
-
-IMPORTANT
----------
-This dataset is intended ONLY for model training.
-
-Evaluation splits such as:
-
-    - validation
-    - test
-
-are NEVER used for training.
-
-For autoregressive language modeling:
-
-    Input:
-        [t1, t2, t3, t4]
-
-    Target:
-        [t2, t3, t4, t5]
-
-The model learns to predict the next token.
-
-============================================================
-"""
-
 from __future__ import annotations
 
-
-# ============================================================
-# Standard Library
-# ============================================================
-
-import sys
-
+import json
 from pathlib import Path
-
-from typing import (
-    Iterator,
-    Optional,
-    Sequence,
-)
-
-
-# ============================================================
-# Project Root
-# ============================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-
-# ============================================================
-# Third-Party
-# ============================================================
+from typing import Any
 
 import torch
+from torch.utils.data import Dataset
 
-from torch.utils.data import IterableDataset
-
-
-# ============================================================
-# Project Imports
-# ============================================================
-
-from tokenizer.my_tokenizer import MyGPTTokenizer
-
-
-# ============================================================
-# Paths
-# ============================================================
-
-TOKENIZER_PATH = (
-    PROJECT_ROOT
-    / "artifacts"
-    / "tokenizer"
-    / "tokenizer.json"
+from training.instruct.formatter import (
+    normalize_messages,
+    role_prefix,
 )
 
 
-# ============================================================
-# Dataset Paths
-# ============================================================
-
-DEFAULT_DATASETS = {
-
-    "TinyStories": (
-        PROJECT_ROOT
-        / "datasets"
-        / "TinyStories"
-        / "raw"
-    ),
-
-    "WikiText103": (
-        PROJECT_ROOT
-        / "datasets"
-        / "WikiText103"
-        / "raw"
-    ),
-
-    "OpenWebText": (
-        PROJECT_ROOT
-        / "datasets"
-        / "OpenWebText"
-        / "raw"
-    ),
-
-    "FineWeb": (
-        PROJECT_ROOT
-        / "datasets"
-        / "FineWeb"
-        / "raw"
-    ),
-}
+IGNORE_INDEX = -100
 
 
-# ============================================================
-# Training Split Configuration
-# ============================================================
-
-# These splits are NEVER used for training.
-#
-# This is deliberately explicit so that a DatasetDict such as:
-#
-#     train
-#     validation
-#     test
-#
-# will only use:
-#
-#     train
-#
-# This prevents accidental data leakage.
-
-EXCLUDED_SPLITS = {
-    "test",
-    "validation",
-    "valid",
-    "dev",
-    "eval",
-    "evaluation",
-}
-
-
-# ============================================================
-# GPT Text Dataset
-# ============================================================
-
-class GPTTextDataset(IterableDataset):
+class InstructionDataset(Dataset):
     """
-    Iterable dataset used for GPT training.
+    Context-aware supervised instruction dataset.
 
-    Documents are loaded one at a time.
+    For every assistant response, create one training example.
 
-    Each document is:
+    Previous conversation turns are provided as context but are masked
+    from the loss.
 
-        text
-          ↓
-        tokenizer
-          ↓
-        token IDs
-          ↓
-        fixed-length chunks
-          ↓
-        input / target tensors
-
-    Parameters
-    ----------
-    dataset_paths:
-        Paths to Hugging Face datasets saved with
-        `save_to_disk()`.
-
-    tokenizer:
-        Instance of MyGPTTokenizer.
-
-    sequence_length:
-        Number of tokens used as model input.
-
-    max_documents:
-        Optional limit for testing.
-
-        None means process all documents.
-
-    stride:
-        Distance between consecutive windows.
-
-        If None, sequence_length is used.
-
-    Notes
-    -----
-    This dataset intentionally uses only training data.
-
-    Evaluation splits such as validation/test are skipped.
+    Only the CURRENT assistant response and EOS are supervised.
     """
 
     def __init__(
         self,
-        dataset_paths: Optional[
-            Sequence[Path]
-        ] = None,
-        tokenizer: Optional[
-            MyGPTTokenizer
-        ] = None,
+        file_path: str | Path,
+        tokenizer,
         sequence_length: int = 512,
-        max_documents: Optional[int] = None,
-        stride: Optional[int] = None,
+        minimum_answer_tokens: int = 64,
     ) -> None:
 
-        super().__init__()
-
-        # ----------------------------------------------------
-        # Validation
-        # ----------------------------------------------------
-
-        if sequence_length < 2:
-
-            raise ValueError(
-                "sequence_length must be at least 2."
-            )
-
-        if tokenizer is None:
-
-            raise ValueError(
-                "A MyGPTTokenizer instance must be provided."
-            )
-
-        if not tokenizer.is_loaded:
-
-            raise RuntimeError(
-                "The tokenizer is not loaded."
-            )
-
-        if max_documents is not None:
-
-            if max_documents < 1:
-
-                raise ValueError(
-                    "max_documents must be positive "
-                    "when specified."
-                )
-
-        if stride is not None:
-
-            if stride < 1:
-
-                raise ValueError(
-                    "stride must be positive "
-                    "when specified."
-                )
-
-        # ----------------------------------------------------
-        # Dataset paths
-        # ----------------------------------------------------
-
-        if dataset_paths is None:
-
-            dataset_paths = list(
-                DEFAULT_DATASETS.values()
-            )
-
-        self.dataset_paths = [
-            Path(path)
-            for path in dataset_paths
-        ]
-
-        # ----------------------------------------------------
-        # Configuration
-        # ----------------------------------------------------
+        self.file_path = Path(file_path)
 
         self.tokenizer = tokenizer
 
-        self.sequence_length = (
+        self.sequence_length = int(
             sequence_length
         )
 
-        self.max_documents = (
-            max_documents
+        self.minimum_answer_tokens = int(
+            minimum_answer_tokens
         )
 
-        self.stride = (
-            stride
-            if stride is not None
-            else sequence_length
-        )
-
-        # ----------------------------------------------------
-        # Runtime statistics
-        # ----------------------------------------------------
-
-        self.documents_seen = 0
-
-        self.documents_processed = 0
-
-        self.documents_skipped = 0
-
-        self.samples_generated = 0
-
-        self.tokens_generated = 0
-
-        # ----------------------------------------------------
-        # Dataset statistics
-        # ----------------------------------------------------
-
-        self.dataset_statistics = {}
-
-    # ========================================================
-    # Reset Statistics
-    # ========================================================
-
-    def reset_statistics(self) -> None:
-        """
-        Reset runtime statistics before a new iteration.
-        """
-
-        self.documents_seen = 0
-
-        self.documents_processed = 0
-
-        self.documents_skipped = 0
-
-        self.samples_generated = 0
-
-        self.tokens_generated = 0
-
-        self.dataset_statistics = {}
-
-    # ========================================================
-    # Load Dataset
-    # ========================================================
-
-    def _load_dataset(
-        self,
-        dataset_path: Path,
-    ):
-        """
-        Load a dataset saved with Hugging Face
-        `save_to_disk()`.
-        """
-
-        from datasets import load_from_disk
-
-        if not dataset_path.exists():
-
+        if not self.file_path.exists():
             raise FileNotFoundError(
-                "Dataset path does not exist:\n"
-                f"{dataset_path}"
+                f"Instruction dataset not found:\n"
+                f"{self.file_path}"
             )
 
-        return load_from_disk(
-            str(dataset_path)
+        if self.sequence_length < 8:
+            raise ValueError(
+                "sequence_length is too small."
+            )
+
+        # -----------------------------------------------------
+        # Special tokens
+        # -----------------------------------------------------
+
+        self.bos_token_id = self._resolve_token_id(
+            names=[
+                "bos_token_id",
+                "bos_id",
+            ],
+            fallback=2,
         )
 
-    # ========================================================
-    # Determine Training Splits
-    # ========================================================
+        self.eos_token_id = self._resolve_token_id(
+            names=[
+                "eos_token_id",
+                "eos_id",
+            ],
+            fallback=3,
+        )
 
-    def _get_training_splits(
-        self,
-        dataset,
-        dataset_name: str,
-    ):
-        """
-        Determine which splits should be used for training.
+        # -----------------------------------------------------
+        # Load conversations
+        # -----------------------------------------------------
 
-        Supported cases:
+        self.conversations: list[
+            dict[str, Any]
+        ] = []
 
-        1. DatasetDict
+        with self.file_path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
 
-            {
-                "train": ...,
-                "validation": ...,
-                "test": ...
-            }
+            for line_number, line in enumerate(
+                file,
+                start=1,
+            ):
 
-            Result:
+                line = line.strip()
 
-                train only
+                if not line:
+                    continue
 
-        2. Dataset
+                try:
+                    record = json.loads(line)
 
-            A dataset without named splits.
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        f"Invalid JSON at "
+                        f"{self.file_path}:"
+                        f"{line_number}"
+                    ) from error
 
-            Result:
+                messages = normalize_messages(
+                    record.get(
+                        "messages",
+                        []
+                    )
+                )
 
-                dataset itself
+                if not messages:
+                    continue
 
-        IMPORTANT
-        ---------
-        Validation/test/evaluation splits are never used.
-        """
+                self.conversations.append(
+                    {
+                        "messages": messages,
+                        "source": record.get(
+                            "source",
+                            "unknown",
+                        ),
+                    }
+                )
 
-        # ----------------------------------------------------
-        # DatasetDict
-        # ----------------------------------------------------
+        # -----------------------------------------------------
+        # Build assistant-response index
+        # -----------------------------------------------------
 
-        if hasattr(dataset, "items"):
+        self.examples: list[
+            dict[str, Any]
+        ] = []
 
-            available_splits = [
-                str(name)
-                for name, _ in dataset.items()
+        for conversation_index, conversation in enumerate(
+            self.conversations
+        ):
+
+            messages = conversation[
+                "messages"
             ]
 
-            print(
-                "  Available Splits : "
-                f"{', '.join(available_splits)}"
-            )
+            assistant_turn = 0
 
-            training_splits = []
+            for message_index, message in enumerate(
+                messages
+            ):
 
-            # ------------------------------------------------
-            # Prefer explicit train split
-            # ------------------------------------------------
-
-            for split_name, split in dataset.items():
-
-                normalized_name = (
-                    str(split_name)
-                    .strip()
-                    .lower()
-                )
-
-                # --------------------------------------------
-                # Never use evaluation splits
-                # --------------------------------------------
-
-                if normalized_name in EXCLUDED_SPLITS:
-
-                    print(
-                        f"  Skipping Split     : "
-                        f"{split_name} "
-                        f"(evaluation split)"
-                    )
-
+                if message["role"] != "assistant":
                     continue
 
-                # --------------------------------------------
-                # Only use train-like split
-                # --------------------------------------------
+                assistant_turn += 1
 
-                if normalized_name == "train":
-
-                    training_splits.append(
-                        (
-                            str(split_name),
-                            split,
-                        )
-                    )
-
-            # ------------------------------------------------
-            # If explicit train split exists
-            # ------------------------------------------------
-
-            if training_splits:
-
-                return training_splits
-
-            # ------------------------------------------------
-            # Fallback
-            # ------------------------------------------------
-            #
-            # Some datasets may have an unusual name.
-            #
-            # We DO NOT automatically consume arbitrary
-            # evaluation-looking data.
-            #
-            # If there is no train split, look for a split
-            # that is not explicitly evaluation data.
-            # ------------------------------------------------
-
-            for split_name, split in dataset.items():
-
-                normalized_name = (
-                    str(split_name)
-                    .strip()
-                    .lower()
-                )
-
-                if normalized_name in EXCLUDED_SPLITS:
-
+                # Require some context before assistant.
+                if message_index == 0:
                     continue
 
-                print(
-                    f"  Using Split        : "
-                    f"{split_name}"
-                )
-
-                return [
-                    (
-                        str(split_name),
-                        split,
-                    )
+                # Most SFT data should have a user request before
+                # the assistant response.
+                previous_messages = messages[
+                    :message_index
                 ]
 
-            # ------------------------------------------------
-            # No valid training split
-            # ------------------------------------------------
+                current_answer = message[
+                    "content"
+                ]
 
-            print(
-                f"  WARNING            : "
-                f"No training split found for "
-                f"{dataset_name}"
+                if not current_answer.strip():
+                    continue
+
+                self.examples.append(
+                    {
+                        "conversation_index": (
+                            conversation_index
+                        ),
+                        "assistant_turn": (
+                            assistant_turn
+                        ),
+                        "context_messages": (
+                            previous_messages
+                        ),
+                        "assistant_content": (
+                            current_answer
+                        ),
+                        "source": conversation[
+                            "source"
+                        ],
+                    }
+                )
+
+    # =========================================================
+    # Helpers
+    # =========================================================
+
+    def _resolve_token_id(
+        self,
+        names: list[str],
+        fallback: int,
+    ) -> int:
+
+        for name in names:
+
+            value = getattr(
+                self.tokenizer,
+                name,
+                None,
             )
 
-            return []
+            if value is not None:
+                return int(value)
 
-        # ----------------------------------------------------
-        # Normal Dataset
-        # ----------------------------------------------------
+        return int(fallback)
 
-        print(
-            "  Split              : dataset"
-        )
-
-        return [
-            (
-                "dataset",
-                dataset,
-            )
-        ]
-
-    # ========================================================
-    # Extract Text
-    # ========================================================
-
-    @staticmethod
-    def _extract_text(
-        record: dict,
-    ) -> str:
-        """
-        Extract the `text` field from a dataset record.
-
-        Returns
-        -------
-        str
-            Clean text or empty string.
-        """
-
-        if not isinstance(
-            record,
-            dict,
-        ):
-
-            return ""
-
-        text = record.get(
-            "text",
-            "",
-        )
-
-        if text is None:
-
-            return ""
-
-        if not isinstance(
-            text,
-            str,
-        ):
-
-            text = str(text)
-
-        return text.strip()
-
-    # ========================================================
-    # Tokenize
-    # ========================================================
-
-    def _tokenize(
+    def _encode_text(
         self,
         text: str,
     ) -> list[int]:
-        """
-        Convert text to token IDs using MyGPTTokenizer.
-        """
 
-        token_ids = (
-            self.tokenizer.encode(
-                text
-            )
+        token_ids = self.tokenizer.encode(
+            text
         )
 
-        if not isinstance(
+        if isinstance(
             token_ids,
-            list,
+            torch.Tensor,
         ):
-
-            raise TypeError(
-                "MyGPTTokenizer.encode() "
-                "must return list[int]."
+            token_ids = (
+                token_ids
+                .detach()
+                .cpu()
+                .tolist()
             )
 
-        return [
-            int(token)
-            for token in token_ids
+        token_ids = [
+            int(token_id)
+            for token_id in token_ids
         ]
 
-    # ========================================================
-    # Create Samples
-    # ========================================================
+        # We control BOS/EOS manually.
+        if (
+            token_ids
+            and token_ids[0]
+            == self.bos_token_id
+        ):
+            token_ids = token_ids[1:]
 
-    def _create_samples(
+        if (
+            token_ids
+            and token_ids[-1]
+            == self.eos_token_id
+        ):
+            token_ids = token_ids[:-1]
+
+        return token_ids
+
+    def _encode_message(
         self,
-        token_ids: list[int],
-    ) -> Iterator[
-        tuple[
-            torch.Tensor,
-            torch.Tensor
-        ]
-    ]:
-        """
-        Convert token IDs into input/target pairs.
+        message: dict[str, str],
+    ) -> list[int]:
 
-        Example:
-
-            Tokens:
-
-                [10, 20, 30, 40, 50]
-
-            sequence_length = 4
-
-            Input:
-
-                [10, 20, 30, 40]
-
-            Target:
-
-                [20, 30, 40, 50]
-        """
-
-        required_tokens = (
-            self.sequence_length + 1
+        prefix = role_prefix(
+            message["role"]
         )
 
-        # ----------------------------------------------------
-        # Document too short
-        # ----------------------------------------------------
+        text = (
+            prefix
+            + message["content"].strip()
+            + "\n\n"
+        )
 
-        if len(token_ids) < required_tokens:
+        return self._encode_text(
+            text
+        )
 
-            return
+    # =========================================================
+    # Context construction
+    # =========================================================
 
-        # ----------------------------------------------------
-        # Sliding window
-        # ----------------------------------------------------
-
-        for start in range(
-            0,
-            len(token_ids)
-            - self.sequence_length,
-            self.stride,
-        ):
-
-            end = (
-                start
-                + self.sequence_length
-                + 1
-            )
-
-            chunk = token_ids[
-                start:end
-            ]
-
-            # ------------------------------------------------
-            # Ignore incomplete sequence
-            # ------------------------------------------------
-
-            if len(chunk) < required_tokens:
-
-                continue
-
-            # ------------------------------------------------
-            # Shift by one token
-            # ------------------------------------------------
-
-            input_ids = chunk[:-1]
-
-            target_ids = chunk[1:]
-
-            # ------------------------------------------------
-            # Convert to tensors
-            # ------------------------------------------------
-
-            input_tensor = torch.tensor(
-                input_ids,
-                dtype=torch.long,
-            )
-
-            target_tensor = torch.tensor(
-                target_ids,
-                dtype=torch.long,
-            )
-
-            # ------------------------------------------------
-            # Statistics
-            # ------------------------------------------------
-
-            self.samples_generated += 1
-
-            self.tokens_generated += (
-                len(input_ids)
-            )
-
-            yield (
-                input_tensor,
-                target_tensor,
-            )
-
-    # ========================================================
-    # Iterator
-    # ========================================================
-
-    def __iter__(
+    def _build_example(
         self,
-    ) -> Iterator[
-        tuple[
-            torch.Tensor,
-            torch.Tensor
-        ]
+        example: dict[str, Any],
+    ) -> tuple[
+        list[int],
+        list[int],
     ]:
-        """
-        Iterate over all training datasets.
 
-        IMPORTANT
-        ---------
-        Only training splits are consumed.
+        context_messages = example[
+            "context_messages"
+        ]
 
-        Evaluation splits are skipped.
-        """
+        assistant_content = example[
+            "assistant_content"
+        ].strip()
 
-        # ----------------------------------------------------
-        # Reset statistics
-        # ----------------------------------------------------
+        # -----------------------------------------------------
+        # Current assistant target
+        # -----------------------------------------------------
 
-        self.reset_statistics()
+        assistant_prefix_ids = self._encode_text(
+            role_prefix(
+                "assistant"
+            )
+        )
 
-        # ----------------------------------------------------
-        # Dataset loop
-        # ----------------------------------------------------
+        answer_ids = self._encode_text(
+            assistant_content
+        )
 
-        for dataset_name, dataset_path in (
-            self._dataset_items()
+        if not answer_ids:
+            raise RuntimeError(
+                "Assistant response encoded to "
+                "zero tokens."
+            )
+
+        # -----------------------------------------------------
+        # Locate current user
+        # -----------------------------------------------------
+
+        current_user_index = None
+
+        for index in range(
+            len(context_messages) - 1,
+            -1,
+            -1,
         ):
 
-            print()
+            if (
+                context_messages[index]["role"]
+                == "user"
+            ):
+                current_user_index = index
+                break
 
-            print(
-                f"Loading Dataset: "
-                f"{dataset_name}"
+        if current_user_index is None:
+            raise RuntimeError(
+                "Assistant response has no "
+                "preceding user message."
             )
 
-            print(
-                f"  Path               : "
-                f"{dataset_path}"
+        current_user_message = (
+            context_messages[
+                current_user_index
+            ]
+        )
+
+        current_user_ids = (
+            self._encode_message(
+                current_user_message
+            )
+        )
+
+        # Everything before the current user becomes optional
+        # historical context.
+        history_messages = (
+            context_messages[
+                :current_user_index
+            ]
+        )
+
+        # -----------------------------------------------------
+        # Fixed token budget
+        # -----------------------------------------------------
+
+        # BOS + EOS
+        fixed_special_tokens = 2
+
+        available = (
+            self.sequence_length
+            - fixed_special_tokens
+            - len(assistant_prefix_ids)
+        )
+
+        if available <= 1:
+            raise RuntimeError(
+                "No usable token budget."
             )
 
-            # ------------------------------------------------
-            # Load dataset
-            # ------------------------------------------------
+        # -----------------------------------------------------
+        # Reserve assistant answer capacity
+        # -----------------------------------------------------
 
-            try:
+        desired_answer_budget = min(
+            len(answer_ids),
+            max(
+                self.minimum_answer_tokens,
+                1,
+            ),
+        )
 
-                dataset = (
-                    self._load_dataset(
-                        dataset_path
-                    )
-                )
+        desired_answer_budget = min(
+            desired_answer_budget,
+            available,
+        )
 
-            except Exception as exc:
+        # -----------------------------------------------------
+        # Current user gets priority
+        # -----------------------------------------------------
 
-                print(
-                    f"  ERROR loading dataset: "
-                    f"{exc}"
-                )
+        user_budget = max(
+            1,
+            available
+            - desired_answer_budget,
+        )
 
-                raise
+        if len(current_user_ids) > user_budget:
 
-            # ------------------------------------------------
-            # Determine training splits
-            # ------------------------------------------------
+            # Preserve the beginning of the user instruction.
+            current_user_ids = (
+                current_user_ids[
+                    :user_budget
+                ]
+            )
 
-            training_splits = (
-                self._get_training_splits(
-                    dataset,
-                    dataset_name,
+        used_without_history = (
+            len(current_user_ids)
+            + len(assistant_prefix_ids)
+            + fixed_special_tokens
+        )
+
+        answer_budget = (
+            self.sequence_length
+            - used_without_history
+        )
+
+        answer_ids = answer_ids[
+            :answer_budget
+        ]
+
+        if not answer_ids:
+            raise RuntimeError(
+                "No room remains for assistant response."
+            )
+
+        # -----------------------------------------------------
+        # Historical context budget
+        # -----------------------------------------------------
+
+        history_budget = (
+            self.sequence_length
+            - (
+                fixed_special_tokens
+                + len(current_user_ids)
+                + len(assistant_prefix_ids)
+                + len(answer_ids)
+            )
+        )
+
+        selected_history: list[
+            list[int]
+        ] = []
+
+        # -----------------------------------------------------
+        # Add newest history first.
+        #
+        # Whole messages only: no mid-message historical
+        # truncation.
+        # -----------------------------------------------------
+
+        for message in reversed(
+            history_messages
+        ):
+
+            message_ids = (
+                self._encode_message(
+                    message
                 )
             )
 
-            # ------------------------------------------------
-            # No usable training split
-            # ------------------------------------------------
-
-            if not training_splits:
-
-                print(
-                    f"  WARNING: No usable "
-                    f"training split."
-                )
-
+            if not message_ids:
                 continue
 
-            # ------------------------------------------------
-            # Split loop
-            # ------------------------------------------------
+            if (
+                len(message_ids)
+                <= history_budget
+            ):
 
-            for (
-                split_name,
-                split,
-            ) in training_splits:
-
-                print(
-                    f"  Training Split      : "
-                    f"{split_name}"
+                selected_history.append(
+                    message_ids
                 )
 
-                # --------------------------------------------
-                # Record loop
-                # --------------------------------------------
-
-                for record in split:
-
-                    # ----------------------------------------
-                    # Document limit
-                    # ----------------------------------------
-
-                    if (
-                        self.max_documents
-                        is not None
-                        and self.documents_seen
-                        >= self.max_documents
-                    ):
-
-                        print()
-
-                        print(
-                            "Maximum document limit "
-                            "reached."
-                        )
-
-                        return
-
-                    # ----------------------------------------
-                    # Document counter
-                    # ----------------------------------------
-
-                    self.documents_seen += 1
-
-                    # ----------------------------------------
-                    # Extract text
-                    # ----------------------------------------
-
-                    text = (
-                        self._extract_text(
-                            record
-                        )
-                    )
-
-                    # ----------------------------------------
-                    # Empty document
-                    # ----------------------------------------
-
-                    if not text:
-
-                        self.documents_skipped += 1
-
-                        continue
-
-                    # ----------------------------------------
-                    # Tokenization
-                    # ----------------------------------------
-
-                    try:
-
-                        token_ids = (
-                            self._tokenize(
-                                text
-                            )
-                        )
-
-                    except Exception as exc:
-
-                        self.documents_skipped += 1
-
-                        print()
-
-                        print(
-                            "WARNING: tokenizer "
-                            "failed."
-                        )
-
-                        print(
-                            f"Dataset : "
-                            f"{dataset_name}"
-                        )
-
-                        print(
-                            f"Split   : "
-                            f"{split_name}"
-                        )
-
-                        print(
-                            f"Document: "
-                            f"{self.documents_seen}"
-                        )
-
-                        print(
-                            f"Error   : "
-                            f"{exc}"
-                        )
-
-                        continue
-
-                    # ----------------------------------------
-                    # Empty token sequence
-                    # ----------------------------------------
-
-                    if not token_ids:
-
-                        self.documents_skipped += 1
-
-                        continue
-
-                    # ----------------------------------------
-                    # Document processed
-                    # ----------------------------------------
-
-                    self.documents_processed += 1
-
-                    # ----------------------------------------
-                    # Generate samples
-                    # ----------------------------------------
-
-                    yield from (
-                        self._create_samples(
-                            token_ids
-                        )
-                    )
-
-    # ========================================================
-    # Dataset Items
-    # ========================================================
-
-    def _dataset_items(self):
-
-        for (
-            name,
-            path,
-        ) in DEFAULT_DATASETS.items():
-
-            if path.exists():
-
-                yield (
-                    name,
-                    path,
+                history_budget -= (
+                    len(message_ids)
                 )
 
-            else:
+        selected_history.reverse()
 
-                print()
+        # -----------------------------------------------------
+        # Construct input + labels
+        # -----------------------------------------------------
 
-                print(
-                    "WARNING: dataset not found:"
-                )
+        input_ids: list[int] = [
+            self.bos_token_id
+        ]
 
-                print(
-                    f"  {name}:"
-                )
+        labels: list[int] = [
+            IGNORE_INDEX
+        ]
 
-                print(
-                    f"  {path}"
-                )
+        # Historical conversation:
+        # context only, never supervised.
+        for history_ids in selected_history:
 
-    # ========================================================
-    # Statistics
-    # ========================================================
+            input_ids.extend(
+                history_ids
+            )
 
-    def get_statistics(self) -> dict:
-        """
-        Return current runtime dataset statistics.
-        """
+            labels.extend(
+                [
+                    IGNORE_INDEX
+                ]
+                * len(history_ids)
+            )
+
+        # Current user:
+        # context only.
+        input_ids.extend(
+            current_user_ids
+        )
+
+        labels.extend(
+            [
+                IGNORE_INDEX
+            ]
+            * len(current_user_ids)
+        )
+
+        # Assistant role prefix:
+        # context only.
+        input_ids.extend(
+            assistant_prefix_ids
+        )
+
+        labels.extend(
+            [
+                IGNORE_INDEX
+            ]
+            * len(
+                assistant_prefix_ids
+            )
+        )
+
+        # Current assistant answer:
+        # supervised.
+        input_ids.extend(
+            answer_ids
+        )
+
+        labels.extend(
+            answer_ids
+        )
+
+        # Train EOS.
+        input_ids.append(
+            self.eos_token_id
+        )
+
+        labels.append(
+            self.eos_token_id
+        )
+
+        # -----------------------------------------------------
+        # Final safety checks
+        # -----------------------------------------------------
+
+        if len(input_ids) != len(labels):
+            raise RuntimeError(
+                "input_ids/labels length mismatch."
+            )
+
+        if (
+            len(input_ids)
+            > self.sequence_length
+        ):
+            raise RuntimeError(
+                "Constructed example exceeds "
+                f"context length: "
+                f"{len(input_ids)} > "
+                f"{self.sequence_length}"
+            )
+
+        supervised_tokens = sum(
+            label != IGNORE_INDEX
+            for label in labels
+        )
+
+        if supervised_tokens <= 1:
+            raise RuntimeError(
+                "Example has no meaningful "
+                "assistant supervision."
+            )
+
+        return (
+            input_ids,
+            labels,
+        )
+
+    # =========================================================
+    # Dataset API
+    # =========================================================
+
+    def __len__(
+        self,
+    ) -> int:
+
+        return len(
+            self.examples
+        )
+
+    def __getitem__(
+        self,
+        index: int,
+    ) -> dict[str, Any]:
+
+        example = self.examples[
+            index
+        ]
+
+        input_ids, labels = (
+            self._build_example(
+                example
+            )
+        )
 
         return {
-
-            "documents_seen": (
-                self.documents_seen
+            "input_ids": torch.tensor(
+                input_ids,
+                dtype=torch.long,
             ),
-
-            "documents_processed": (
-                self.documents_processed
+            "labels": torch.tensor(
+                labels,
+                dtype=torch.long,
             ),
-
-            "documents_skipped": (
-                self.documents_skipped
+            "source": example[
+                "source"
+            ],
+            "conversation_index": (
+                example[
+                    "conversation_index"
+                ]
             ),
-
-            "samples_generated": (
-                self.samples_generated
-            ),
-
-            "tokens_generated": (
-                self.tokens_generated
+            "assistant_turn": (
+                example[
+                    "assistant_turn"
+                ]
             ),
         }
-
-
-# ============================================================
-# Dataset Factory
-# ============================================================
-
-def create_training_dataset(
-    tokenizer: MyGPTTokenizer,
-    sequence_length: int = 512,
-    max_documents: Optional[int] = None,
-    stride: Optional[int] = None,
-) -> GPTTextDataset:
-    """
-    Create the default MyGPT2 training dataset.
-    """
-
-    return GPTTextDataset(
-
-        dataset_paths=list(
-            DEFAULT_DATASETS.values()
-        ),
-
-        tokenizer=tokenizer,
-
-        sequence_length=sequence_length,
-
-        max_documents=max_documents,
-
-        stride=stride,
-    )
-
-
-# ============================================================
-# Test
-# ============================================================
-
-if __name__ == "__main__":
-
-    print("=" * 70)
-
-    print(
-        "MyGPT2 Training Dataset Test"
-    )
-
-    print("=" * 70)
-
-    print()
-
-    # --------------------------------------------------------
-    # Verify tokenizer file
-    # --------------------------------------------------------
-
-    if not TOKENIZER_PATH.exists():
-
-        raise FileNotFoundError(
-            "Tokenizer file not found:\n"
-            f"{TOKENIZER_PATH}"
-        )
-
-    # --------------------------------------------------------
-    # Load tokenizer
-    # --------------------------------------------------------
-
-    print(
-        "Loading tokenizer..."
-    )
-
-    tokenizer = (
-        MyGPTTokenizer.load(
-            TOKENIZER_PATH
-        )
-    )
-
-    print(
-        "Tokenizer loaded successfully."
-    )
-
-    print(
-        f"Vocabulary Size : "
-        f"{tokenizer.vocabulary_size:,}"
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # Test configuration
-    # --------------------------------------------------------
-
-    sequence_length = 512
-
-    batch_size = 4
-
-    max_documents = 10000
-
-    print(
-        "Dataset configuration:"
-    )
-
-    print(
-        f"  Sequence Length : "
-        f"{sequence_length}"
-    )
-
-    print(
-        f"  Batch Size      : "
-        f"{batch_size}"
-    )
-
-    print(
-        f"  Max Documents   : "
-        f"{max_documents}"
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # Create dataset
-    # --------------------------------------------------------
-
-    dataset = create_training_dataset(
-
-        tokenizer=tokenizer,
-
-        sequence_length=sequence_length,
-
-        max_documents=max_documents,
-    )
-
-    print(
-        "Dataset created successfully."
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # Read samples
-    # --------------------------------------------------------
-
-    sample_count = 0
-
-    for (
-        input_ids,
-        target_ids,
-    ) in dataset:
-
-        sample_count += 1
-
-        print(
-            f"Sample {sample_count}"
-        )
-
-        print(
-            f"Input Shape  : "
-            f"{tuple(input_ids.shape)}"
-        )
-
-        print(
-            f"Target Shape : "
-            f"{tuple(target_ids.shape)}"
-        )
-
-        print(
-            f"Input IDs    : "
-            f"{input_ids.tolist()}"
-        )
-
-        print(
-            f"Target IDs   : "
-            f"{target_ids.tolist()}"
-        )
-
-        print(
-            "-" * 70
-        )
-
-        if sample_count >= 3:
-
-            break
-
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
-
-    print()
-
-    print("=" * 70)
-
-    print(
-        "Dataset Test Summary"
-    )
-
-    print("=" * 70)
-
-    stats = dataset.get_statistics()
-
-    for (
-        key,
-        value,
-    ) in stats.items():
-
-        print(
-            f"{key:25}: "
-            f"{value:,}"
-        )
-
-    print()
-
-    print(
-        "Dataset test completed successfully."
-    )
-
-    print("=" * 70)

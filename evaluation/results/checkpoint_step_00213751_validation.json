@@ -1,0 +1,72 @@
+{
+    "evaluation_version": 2,
+    "evaluated_at_utc": "2026-08-30T03:16:44.389882+00:00",
+    "checkpoint": {
+        "file": "D:\\Gpt2_v01\\artifacts\\checkpoints\\final_step_00213751.pt",
+        "name": "final_step_00213751.pt",
+        "global_step": 213751,
+        "epoch": 0,
+        "saved_train_loss": 4.3478288650512695,
+        "saved_val_loss": null,
+        "checkpoint_version": "1.2"
+    },
+    "model": {
+        "vocab_size": 32000,
+        "max_position_embeddings": 512,
+        "hidden_size": 768,
+        "num_layers": 12,
+        "num_attention_heads": 12,
+        "intermediate_size": 3072,
+        "parameter_count": 110025216,
+        "trainable_parameter_count": 110025216,
+        "matching_checkpoint_tensors": 149
+    },
+    "evaluation": {
+        "validation_loss": 4.144575858602718,
+        "validation_perplexity": 63.09085678189745,
+        "evaluated_tokens": 100352,
+        "evaluated_sequences": 196,
+        "elapsed_seconds": 3.656302899995353,
+        "tokens_per_second": 27446.303751291376,
+        "peak_gpu_memory_mb": 1452.54150390625,
+        "dataset_token_counts": {
+            "TinyStories:validation": 50176,
+            "WikiText103:validation": 50176
+        },
+        "per_dataset": {
+            "TinyStories:validation": {
+                "sequences": 98,
+                "tokens": 50176,
+                "loss": 3.1132408842748527,
+                "perplexity": 22.493826286100024
+            },
+            "WikiText103:validation": {
+                "sequences": 98,
+                "tokens": 50176,
+                "loss": 5.175910905915863,
+                "perplexity": 176.95773272901647
+            }
+        },
+        "batch_size": 8,
+        "max_eval_tokens_requested": 100000,
+        "sequence_length": 512
+    },
+    "sources": [
+        {
+            "dataset": "TinyStories",
+            "split": "validation",
+            "rows": 21990,
+            "text_column": "text"
+        },
+        {
+            "dataset": "WikiText103",
+            "split": "validation",
+            "rows": 3760,
+            "text_column": "text"
+        }
+    ],
+    "device": {
+        "type": "cuda",
+        "name": "NVIDIA GeForce RTX 5060 Ti"
+    }
+}

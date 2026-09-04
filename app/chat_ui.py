@@ -8,13 +8,21 @@ from pathlib import Path
 import gradio as gr
 
 
+# ============================================================
+# Project Root
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-if str(PROJECT_ROOT) not in sys.path:
+if str(
+    PROJECT_ROOT
+) not in sys.path:
 
     sys.path.insert(
         0,
-        str(PROJECT_ROOT),
+        str(
+            PROJECT_ROOT
+        ),
     )
 
 
@@ -25,117 +33,349 @@ from app.inference_engine import MyGPTInferenceEngine
 # Load Model Once
 # ============================================================
 
-print("Loading MyGPT2...")
+print()
+print("=" * 72)
+print("MYGPT2 INSTRUCT UI")
+print("=" * 72)
+print("Loading model...")
 
 engine = MyGPTInferenceEngine()
 
 status = engine.status()
 
-print("MyGPT2 loaded successfully.")
+print()
+print("Model loaded successfully.")
+print(
+    f"Checkpoint      : "
+    f"{status['checkpoint']}"
+)
+print(
+    f"Checkpoint step : "
+    f"{status['step']}"
+)
+print(
+    f"Parameters      : "
+    f"{status['parameters']:,}"
+)
+print(
+    f"Context         : "
+    f"{status['context_length']}"
+)
+print(
+    f"Vocabulary      : "
+    f"{status['vocab_size']:,}"
+)
+print(
+    f"Device          : "
+    f"{status['device']}"
+)
+print(
+    f"GPU             : "
+    f"{status['gpu']}"
+)
+print("=" * 72)
+print()
 
 
 # ============================================================
-# Model Interaction
+# History Helpers
+# ============================================================
+
+def normalize_history(
+    history,
+):
+
+    if history is None:
+
+        return []
+
+    normalized = []
+
+    for item in history:
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+
+            continue
+
+        role = str(
+            item.get(
+                "role",
+                "",
+            )
+        ).strip().lower()
+
+        content = item.get(
+            "content",
+            "",
+        )
+
+        if content is None:
+
+            continue
+
+        content = str(
+            content
+        ).strip()
+
+        if (
+            role
+            not in {
+                "user",
+                "assistant",
+                "system",
+            }
+            or
+            not content
+        ):
+
+            continue
+
+        normalized.append(
+            {
+                "role": role,
+                "content": content,
+            }
+        )
+
+    return normalized
+
+
+# ============================================================
+# Generate Response
 # ============================================================
 
 def generate_response(
     message,
-    history,
+    history_state,
     temperature,
     top_k,
     top_p,
+    repetition_penalty,
+    no_repeat_ngram_size,
     max_new_tokens,
 ):
 
-    if not message.strip():
+    message = (
+        ""
+        if message is None
+        else str(
+            message
+        ).strip()
+    )
+
+    history = normalize_history(
+        history_state
+    )
+
+    if not message:
 
         return (
             history,
+            history,
             "",
-            "Waiting for a prompt..."
+            "Waiting for a prompt...",
         )
 
 
-    # --------------------------------------------------------
-    # Since this is currently a BASE MODEL and not yet an
-    # instruction-tuned chat model, keep the prompt simple.
-    # --------------------------------------------------------
+    try:
 
-    prompt = message.strip()
+        # ----------------------------------------------------
+        # Generate using SFT model and existing conversation
+        # ----------------------------------------------------
 
+        result = engine.generate(
+            prompt=message,
 
-    result = engine.generate(
+            history=history,
 
-        prompt,
+            temperature=float(
+                temperature
+            ),
 
-        temperature=float(
-            temperature
-        ),
+            top_k=int(
+                top_k
+            ),
 
-        top_k=int(
-            top_k
-        ),
+            top_p=float(
+                top_p
+            ),
 
-        top_p=float(
-            top_p
-        ),
+            repetition_penalty=float(
+                repetition_penalty
+            ),
 
-        max_new_tokens=int(
-            max_new_tokens
-        ),
+            no_repeat_ngram_size=int(
+                no_repeat_ngram_size
+            ),
 
-    )
-
-
-    generated_text = result[
-        "text"
-    ]
-
-
-if history is None:
-    history = []
-
-history = history + [
-    [message, generated_text]
-]
+            max_new_tokens=int(
+                max_new_tokens
+            ),
+        )
 
 
-    metrics = (
+        # ----------------------------------------------------
+        # Model response
+        # ----------------------------------------------------
 
-        f"Generated "
-        f"{result['generated_tokens']} tokens"
-        f"  •  "
-        f"{result['tokens_per_second']:.1f} tok/s"
-        f"  •  "
-        f"{result['elapsed_seconds']:.2f}s"
-        f"  •  "
-        f"Prompt: {result['input_tokens']} tokens"
+        generated_text = str(
+            result.get(
+                "text",
+                "",
+            )
+        ).strip()
 
-    )
+        if not generated_text:
+
+            generated_text = (
+                "[Model produced no visible response.]"
+            )
 
 
-    return (
-        history,
-        "",
-        metrics,
-    )
+        # ----------------------------------------------------
+        # Messages-format conversation
+        # ----------------------------------------------------
+
+        updated_history = history + [
+
+            {
+                "role": "user",
+                "content": message,
+            },
+
+            {
+                "role": "assistant",
+                "content": generated_text,
+            },
+
+        ]
+
+
+        # ----------------------------------------------------
+        # Metrics
+        # ----------------------------------------------------
+
+        generated_tokens = int(
+            result.get(
+                "generated_tokens",
+                0,
+            )
+        )
+
+        input_tokens = int(
+            result.get(
+                "input_tokens",
+                0,
+            )
+        )
+
+        elapsed_seconds = float(
+            result.get(
+                "elapsed_seconds",
+                0.0,
+            )
+        )
+
+        tokens_per_second = float(
+            result.get(
+                "tokens_per_second",
+                0.0,
+            )
+        )
+
+        stopped_on_eos = bool(
+            result.get(
+                "stopped_on_eos",
+                False,
+            )
+        )
+
+        stop_reason = (
+            "EOS"
+            if result["stopped_on_eos"]
+            else "Max tokens"
+        )
+
+        metrics = (
+            f"Context {result['input_tokens']} tokens"
+            f"  •  "
+            f"Generated {result['generated_tokens']} tokens"
+            f"  •  "
+            f"{result['tokens_per_second']:.1f} tok/s"
+            f"  •  "
+            f"{result['elapsed_seconds']:.2f}s"
+            f"  •  "
+            f"Stop: {stop_reason}"
+            f"  •  "
+            f"History: {result['history_turns_used']}/"
+            f"{result['history_turns_total']} turns"
+            f"  •  "
+            f"Dropped: {result['history_turns_dropped']}"
+        )
+
+
+        # ----------------------------------------------------
+        # Return
+        #
+        # 1. Chatbot display
+        # 2. Internal state
+        # 3. Clear textbox
+        # 4. Metrics
+        # ----------------------------------------------------
+
+        return (
+            updated_history,
+            updated_history,
+            "",
+            metrics,
+        )
+
+
+    except Exception as error:
+
+        error_text = (
+            f"{type(error).__name__}: "
+            f"{error}"
+        )
+
+        print()
+        print("=" * 72)
+        print("GENERATION ERROR")
+        print("=" * 72)
+        print(error_text)
+        print("=" * 72)
+        print()
+
+        return (
+            history,
+            history,
+            message,
+            (
+                "⚠️ **Generation failed:** "
+                f"`{error_text}`"
+            ),
+        )
 
 
 # ============================================================
-# Clear
+# Clear Conversation
 # ============================================================
 
 def clear_chat():
 
     return (
         [],
+        [],
         "",
-        "Conversation cleared."
+        "Conversation cleared.",
     )
 
 
 # ============================================================
-# Custom CSS
+# CSS
 # ============================================================
 
 CSS = """
@@ -171,19 +411,27 @@ body {
 #app-shell {
     border: 1px solid #202532;
     border-radius: 22px;
+
     overflow: hidden;
+
     background:
         linear-gradient(
             145deg,
             rgba(18, 21, 29, 0.98),
             rgba(9, 11, 16, 0.98)
         );
+
     box-shadow:
-        0 30px 80px rgba(0, 0, 0, 0.45);
+        0 30px 80px
+        rgba(0, 0, 0, 0.45);
 }
 
 #header {
-    padding: 10px 4px 18px 4px;
+    padding:
+        10px
+        4px
+        18px
+        4px;
 }
 
 #brand-title {
@@ -200,46 +448,89 @@ body {
 }
 
 #model-pill {
-    border: 1px solid #262c38;
-    background: #10131a;
-    border-radius: 14px;
-    padding: 12px 14px;
-    color: #a9b0bd;
-    font-size: 13px;
+    border:
+        1px solid
+        #262c38;
+
+    background:
+        #10131a;
+
+    border-radius:
+        14px;
+
+    padding:
+        12px
+        14px;
+
+    color:
+        #a9b0bd;
+
+    font-size:
+        13px;
 }
 
 #sidebar {
-    border-right: 1px solid #202532;
-    padding-right: 18px;
+    border-right:
+        1px solid
+        #202532;
+
+    padding-right:
+        18px;
 }
 
 #settings-title {
-    font-weight: 600;
-    margin-bottom: 4px;
+    font-weight:
+        600;
+
+    margin-bottom:
+        4px;
 }
 
 #chatbot {
-    border: 1px solid #202532 !important;
-    border-radius: 18px !important;
-    background: #0b0e14 !important;
-    min-height: 610px;
+    border:
+        1px solid
+        #202532 !important;
+
+    border-radius:
+        18px !important;
+
+    background:
+        #0b0e14 !important;
+
+    min-height:
+        610px;
 }
 
 #chatbot .message {
-    border-radius: 16px !important;
+    border-radius:
+        16px !important;
 }
 
 #prompt-box textarea {
-    background: #0c0f15 !important;
-    border: 1px solid #272c38 !important;
-    border-radius: 16px !important;
-    color: #f0f2f5 !important;
-    font-size: 15px !important;
+    background:
+        #0c0f15 !important;
+
+    border:
+        1px solid
+        #272c38 !important;
+
+    border-radius:
+        16px !important;
+
+    color:
+        #f0f2f5 !important;
+
+    font-size:
+        15px !important;
 }
 
 #prompt-box textarea:focus {
-    border-color: #4a5263 !important;
-    box-shadow: 0 0 0 1px #4a5263 !important;
+    border-color:
+        #4a5263 !important;
+
+    box-shadow:
+        0 0 0 1px
+        #4a5263 !important;
 }
 
 #generate-button {
@@ -249,31 +540,56 @@ body {
             #e8ebf0,
             #b9c0cc
         ) !important;
-    color: #090b10 !important;
-    border: none !important;
-    font-weight: 700 !important;
-    border-radius: 12px !important;
+
+    color:
+        #090b10 !important;
+
+    border:
+        none !important;
+
+    font-weight:
+        700 !important;
+
+    border-radius:
+        12px !important;
 }
 
 #generate-button:hover {
-    filter: brightness(1.06);
+    filter:
+        brightness(
+            1.06
+        );
 }
 
 #clear-button {
-    border: 1px solid #292f3b !important;
-    background: #11151c !important;
-    color: #aeb4c0 !important;
-    border-radius: 12px !important;
+    border:
+        1px solid
+        #292f3b !important;
+
+    background:
+        #11151c !important;
+
+    color:
+        #aeb4c0 !important;
+
+    border-radius:
+        12px !important;
 }
 
 #metrics {
-    color: #7f8796;
-    font-size: 12px;
-    margin-top: 5px;
+    color:
+        #7f8796;
+
+    font-size:
+        12px;
+
+    margin-top:
+        5px;
 }
 
 footer {
-    display: none !important;
+    display:
+        none !important;
 }
 """
 
@@ -292,34 +608,55 @@ theme = gr.themes.Base(
 
 ).set(
 
-    body_background_fill="#07090d",
+    body_background_fill=(
+        "#07090d"
+    ),
 
-    block_background_fill="#0e1118",
+    block_background_fill=(
+        "#0e1118"
+    ),
 
-    block_border_color="#202532",
+    block_border_color=(
+        "#202532"
+    ),
 
-    input_background_fill="#0c0f15",
+    input_background_fill=(
+        "#0c0f15"
+    ),
 
-    button_primary_background_fill="#d9dde5",
+    button_primary_background_fill=(
+        "#d9dde5"
+    ),
 
-    button_primary_text_color="#0b0d12",
-
+    button_primary_text_color=(
+        "#0b0d12"
+    ),
 )
 
 
 # ============================================================
-# UI
+# User Interface
 # ============================================================
 
 with gr.Blocks(
-
-    title="MyGPT2",
-
+    title="MyGPT2 Instruct",
 ) as demo:
 
 
+    # --------------------------------------------------------
+    # Internal application state
+    #
+    # Chatbot = visual component
+    # State   = conversation source of truth
+    # --------------------------------------------------------
+
+    conversation_state = gr.State(
+        []
+    )
+
+
     with gr.Column(
-        elem_id="app-shell"
+        elem_id="app-shell",
     ):
 
 
@@ -328,28 +665,30 @@ with gr.Blocks(
         # ====================================================
 
         with gr.Row(
-            elem_id="header"
+            elem_id="header",
         ):
 
+
             with gr.Column(
-                scale=3
+                scale=3,
             ):
 
                 gr.HTML(
                     """
                     <div id="brand-title">
-                        MyGPT2
+                        MyGPT2 Instruct
                     </div>
 
                     <div id="brand-subtitle">
-                        Local transformer inference playground
+                        Local 110M parameter
+                        instruction-tuned transformer
                     </div>
                     """
                 )
 
 
             with gr.Column(
-                scale=2
+                scale=2,
             ):
 
                 gr.HTML(
@@ -357,15 +696,26 @@ with gr.Blocks(
                     <div id="model-pill">
 
                         <b>Checkpoint</b>
-                        &nbsp; step {status['step']}
+                        &nbsp;
+                        {status['checkpoint']}
+
+                        &nbsp;&nbsp;·&nbsp;&nbsp;
+
+                        <b>Step</b>
+                        &nbsp;
+                        {status['step']}
+
                         &nbsp;&nbsp;·&nbsp;&nbsp;
 
                         <b>Parameters</b>
-                        &nbsp; {status['parameters'] / 1_000_000:.1f}M
+                        &nbsp;
+                        {status['parameters']/ 1_000_000:.1f}M
+
                         &nbsp;&nbsp;·&nbsp;&nbsp;
 
-                        <b>Device</b>
-                        &nbsp; {status['gpu']}
+                        <b>GPU</b>
+                        &nbsp;
+                        {status['gpu']}
 
                     </div>
                     """
@@ -388,6 +738,7 @@ with gr.Blocks(
                 elem_id="sidebar",
             ):
 
+
                 gr.Markdown(
                     "### Generation Settings",
                     elem_id="settings-title",
@@ -400,14 +751,16 @@ with gr.Blocks(
 
                     maximum=1.5,
 
-                    value=0.8,
+                    value=0.70,
 
                     step=0.05,
 
                     label="Temperature",
 
-                    info="Lower = safer, higher = more random",
-
+                    info=(
+                        "Lower = more focused, "
+                        "higher = more random"
+                    ),
                 )
 
 
@@ -417,27 +770,62 @@ with gr.Blocks(
 
                     maximum=200,
 
-                    value=50,
+                    value=40,
 
                     step=1,
 
                     label="Top-k",
-
                 )
 
 
                 top_p = gr.Slider(
 
-                    minimum=0.1,
+                    minimum=0.10,
 
                     maximum=1.0,
 
-                    value=0.95,
+                    value=0.90,
 
                     step=0.01,
 
                     label="Top-p",
+                )
 
+
+                repetition_penalty = gr.Slider(
+
+                    minimum=1.0,
+
+                    maximum=1.5,
+
+                    value=1.15,
+
+                    step=0.01,
+
+                    label="Repetition penalty",
+
+                    info=(
+                        "Discourages repeated tokens"
+                    ),
+                )
+
+
+                no_repeat_ngram_size = gr.Slider(
+
+                    minimum=0,
+
+                    maximum=6,
+
+                    value=3,
+
+                    step=1,
+
+                    label="No-repeat n-gram",
+
+                    info=(
+                        "3 prevents repeated trigrams; "
+                        "0 disables it"
+                    ),
                 )
 
 
@@ -452,36 +840,45 @@ with gr.Blocks(
                     step=10,
 
                     label="Max new tokens",
-
                 )
 
 
                 gr.Markdown(
                     f"""
                     ---
+
                     ### Model
 
                     **Architecture**  
                     GPT-2 style decoder
 
+                    **Checkpoint**  
+                    `{status['checkpoint']}`
+
+                    **Checkpoint step**  
+                    `{status['step']}`
+
                     **Context**  
-                    {status['context_length']} tokens
+                    `{status['context_length']}` tokens
 
                     **Vocabulary**  
-                    {status['vocab_size']:,}
+                    `{status['vocab_size']:,}`
 
-                    **Checkpoint Step**  
-                    {status['step']}
+                    **Parameters**  
+                    `{status['parameters']:,}`
 
                     **Device**  
                     `{status['device']}`
 
                     ---
-                    **Suggested baseline**
 
-                    Temperature: `0.8`  
-                    Top-k: `50`  
-                    Top-p: `0.95`
+                    ### Recommended baseline
+
+                    Temperature: `0.70`  
+                    Top-k: `40`  
+                    Top-p: `0.90`  
+                    Repetition penalty: `1.15`  
+                    No-repeat n-gram: `3`
                     """
                 )
 
@@ -491,25 +888,31 @@ with gr.Blocks(
             # =================================================
 
             with gr.Column(
-                scale=4
+                scale=4,
             ):
 
+
                 chatbot = gr.Chatbot(
+
                     value=[],
+
                     elem_id="chatbot",
+
                     height=610,
+
                     show_label=False,
+
                     placeholder=(
-                        "Enter a prompt and explore what "
-                        "your MyGPT2 model has learned."
+                        "Start a conversation "
+                        "with MyGPT2 Instruct."
                     ),
-                )   
+                )
 
 
                 message = gr.Textbox(
 
                     placeholder=(
-                        "Write something for MyGPT2..."
+                        "Message MyGPT2..."
                     ),
 
                     lines=3,
@@ -519,18 +922,17 @@ with gr.Blocks(
                     show_label=False,
 
                     elem_id="prompt-box",
-
                 )
 
 
                 with gr.Row():
+
 
                     clear_button = gr.Button(
 
                         "Clear",
 
                         elem_id="clear-button",
-
                     )
 
 
@@ -541,7 +943,6 @@ with gr.Blocks(
                         variant="primary",
 
                         elem_id="generate-button",
-
                     )
 
 
@@ -550,12 +951,11 @@ with gr.Blocks(
                     "Model ready.",
 
                     elem_id="metrics",
-
                 )
 
 
         # ====================================================
-        # Events
+        # Generate Button
         # ====================================================
 
         generate_button.click(
@@ -566,13 +966,17 @@ with gr.Blocks(
 
                 message,
 
-                chatbot,
+                conversation_state,
 
                 temperature,
 
                 top_k,
 
                 top_p,
+
+                repetition_penalty,
+
+                no_repeat_ngram_size,
 
                 max_new_tokens,
 
@@ -582,14 +986,19 @@ with gr.Blocks(
 
                 chatbot,
 
+                conversation_state,
+
                 message,
 
                 metrics,
 
             ],
-
         )
 
+
+        # ====================================================
+        # Enter / Submit
+        # ====================================================
 
         message.submit(
 
@@ -599,13 +1008,17 @@ with gr.Blocks(
 
                 message,
 
-                chatbot,
+                conversation_state,
 
                 temperature,
 
                 top_k,
 
                 top_p,
+
+                repetition_penalty,
+
+                no_repeat_ngram_size,
 
                 max_new_tokens,
 
@@ -615,14 +1028,19 @@ with gr.Blocks(
 
                 chatbot,
 
+                conversation_state,
+
                 message,
 
                 metrics,
 
             ],
-
         )
 
+
+        # ====================================================
+        # Clear Button
+        # ====================================================
 
         clear_button.click(
 
@@ -634,12 +1052,13 @@ with gr.Blocks(
 
                 chatbot,
 
+                conversation_state,
+
                 message,
 
                 metrics,
 
             ],
-
         )
 
 
@@ -652,10 +1071,18 @@ if __name__ == "__main__":
     demo.queue()
 
     demo.launch(
-        server_name="127.0.0.1",
+
+        server_name=(
+            "127.0.0.1"
+        ),
+
         server_port=7860,
+
         show_error=True,
+
         inbrowser=True,
+
         theme=theme,
+
         css=CSS,
     )
